@@ -380,6 +380,33 @@ queue, one source.
 | `:etf` (default) | Preserves full Elixir term fidelity. |
 | `:json` | Payloads are renderable by the `temporal` CLI and by non-Elixir clients. Term encoding is lossy: atoms become strings, and tuples are unsupported. |
 
+### TLS and authentication
+
+A server that requires TLS, client certificates (mTLS) or an API key takes three
+more client options:
+
+```elixir
+{Temporalex.Client,
+ name: MyApp.Temporal,
+ target: "temporal.internal:7233",
+ api_key: System.fetch_env!("TEMPORAL_API_KEY"),
+ tls: [
+   server_root_ca_cert_file: "/etc/temporal/ca.crt",
+   client_cert_file: "/etc/temporal/client.crt",
+   client_private_key_file: "/etc/temporal/client.key",
+   domain: "temporal.internal"
+ ]}
+```
+
+| Option | Meaning |
+| --- | --- |
+| `api_key:` | Sent as `Authorization: Bearer <key>` on every call. |
+| `tls: true` | TLS, verifying the server against the system's roots. |
+| `tls: [...]` | TLS with the given material. Each PEM is given inline (`:server_root_ca_cert`, `:client_cert`, `:client_private_key`) or as a path (the same key with `_file`); `:domain` is the server name to verify, when it differs from the target's host. The client certificate and key go together. |
+
+With `:tls`, a target without a scheme uses `https`; an explicit `http://`
+target with `:tls` is refused rather than silently sent in plaintext.
+
 ## Drive workflows from a client
 
 ```elixir

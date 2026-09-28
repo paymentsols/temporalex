@@ -8,12 +8,12 @@ use serde_json::{Number as JsonNumber, Value as JsonValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, TlsOptions, UntypedQuery, UntypedSignal,
-    UntypedUpdate, UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions,
-    WorkflowExecuteUpdateOptions, WorkflowExecutionDescription, WorkflowExecutionInfo,
-    WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowHandle,
-    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions, WorkflowStartSignal,
-    WorkflowTerminateOptions,
+    Client, ClientOptions, ClientTlsOptions, Connection, ConnectionOptions, TlsOptions,
+    UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, WorkflowCancelOptions,
+    WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecutionDescription,
+    WorkflowExecutionInfo, WorkflowExecutionStatus, WorkflowFetchHistoryOptions,
+    WorkflowGetResultOptions, WorkflowHandle, WorkflowQueryOptions, WorkflowSignalOptions,
+    WorkflowStartOptions, WorkflowStartSignal, WorkflowTerminateOptions,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowStartError,
         WorkflowUpdateError,
@@ -56,6 +56,10 @@ rustler::atoms! {
     nil,
     connected,
     connect_error,
+    server_root_ca_cert,
+    client_cert,
+    client_private_key,
+    domain,
     worker_started,
     worker_error,
     workflow_activation,
@@ -541,11 +545,12 @@ fn otlp_options(
 }
 
 #[rustler::nif]
-fn connect(
+fn connect<'a>(
     runtime: ResourceArc<RuntimeResource>,
     target: String,
     api_key: Option<String>,
     headers: HashMap<String, String>,
+    tls: Term<'a>,
     pid: LocalPid,
 ) -> Atom {
     let handle = runtime.core.tokio_handle();
@@ -555,15 +560,19 @@ fn connect(
     } else {
         Some(headers)
     };
+    // Decoded here, while the terms are still alive; errors surface through the
+    // connect result like any other connection failure.
+    let tls = tls_options_from_term(tls);
 
     handle.clone().spawn(async move {
         let guard = TaskGuard::new(pid, GuardFailure::Connect);
         let result = async {
-            let url = parse_target_url(&target)?;
-            let tls = if url.scheme() == "https" {
-                Some(TlsOptions::default())
-            } else {
-                None
+            let tls = tls?;
+            let url = target_url(&target, tls.is_some())?;
+            let tls = match tls {
+                Some(tls) => Some(tls),
+                None if url.scheme() == "https" => Some(TlsOptions::default()),
+                None => None,
             };
 
             let connection_options = ConnectionOptions::new(url)
@@ -1439,6 +1448,62 @@ fn parse_target_url(target: &str) -> anyhow::Result<Url> {
     } else {
         Ok(Url::parse(&format!("http://{target}"))?)
     }
+}
+
+// A bare "host:port" target means https when TLS options are given; an explicit
+// http:// target with TLS options is a contradiction and is refused.
+fn target_url(target: &str, tls: bool) -> anyhow::Result<Url> {
+    match (tls, target.contains("://")) {
+        (true, false) => Ok(Url::parse(&format!("https://{target}"))?),
+        (true, true) if target.starts_with("http://") => {
+            Err(anyhow!(":tls options need an https target, got {target:?}"))
+        }
+        _ => parse_target_url(target),
+    }
+}
+
+// `:tls` as sent by Temporalex.Backend.TemporalCore: nil for no explicit TLS,
+// or a keyword list of PEM binaries (:server_root_ca_cert, :client_cert,
+// :client_private_key) and the server name to verify (:domain).
+fn tls_options_from_term(tls: Term) -> anyhow::Result<Option<TlsOptions>> {
+    if tls.decode::<Atom>().ok() == Some(nil()) {
+        return Ok(None);
+    }
+
+    let client_tls_options = match (
+        keyword_get_bytes(tls, client_cert())?,
+        keyword_get_bytes(tls, client_private_key())?,
+    ) {
+        (Some(cert), Some(key)) => Some(
+            ClientTlsOptions::builder()
+                .client_cert(cert)
+                .client_private_key(key)
+                .build(),
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                ":tls needs :client_cert and :client_private_key together"
+            ));
+        }
+    };
+
+    Ok(Some(
+        TlsOptions::builder()
+            .maybe_server_root_ca_cert(keyword_get_bytes(tls, server_root_ca_cert())?)
+            .maybe_domain(keyword_get_string(tls, domain())?)
+            .maybe_client_tls_options(client_tls_options)
+            .build(),
+    ))
+}
+
+fn keyword_get_bytes(opts: Term, key: Atom) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(term) = keyword_get_present(opts, key)? else {
+        return Ok(None);
+    };
+
+    let binary: Binary = decode_term(term)?;
+    Ok(Some(binary.as_slice().to_vec()))
 }
 
 /// Attach the owner-death monitor from a real NIF context. Must be called
