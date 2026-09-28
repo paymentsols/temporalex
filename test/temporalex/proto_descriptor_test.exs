@@ -3,10 +3,14 @@ defmodule Temporalex.ProtoDescriptorTest do
   That the committed descriptor was generated from the sdk-rust revision the
   NIF is built against.
 
-  A stale descriptor does not fail — it decodes, minus whatever the newer proto
-  tree added, so a field the server did send reads as absent and every
-  assertion about it passes for the wrong reason. That is the failure
-  `priority_decode_test.exs` warns about for one field; this covers the tree.
+  A stale descriptor fails in one of two ways. Usually it still decodes, minus
+  whatever the newer proto tree added, so a field the server did send reads as
+  absent and every assertion about it passes for the wrong reason. That is the
+  failure `priority_decode_test.exs` warns about for one field. But when a field
+  number changes wire type, decoding fails outright: sdk-rust v1.0.0 renumbered
+  `InitializeWorkflow.original_execution_run_id` (a string) onto field 26, which
+  the v0.7.0 descriptor reads as the int64 `originating_event_id`, so every
+  workflow start fails with `:wrong_wire_type`. This test covers the tree.
   """
 
   use ExUnit.Case, async: true

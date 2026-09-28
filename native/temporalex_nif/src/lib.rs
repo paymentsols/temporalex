@@ -8,12 +8,12 @@ use serde_json::{Number as JsonNumber, Value as JsonValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, TlsOptions, UntypedQuery, UntypedSignal,
-    UntypedUpdate, UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions,
-    WorkflowExecuteUpdateOptions, WorkflowExecutionDescription, WorkflowExecutionInfo,
-    WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowHandle,
-    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions, WorkflowStartSignal,
-    WorkflowTerminateOptions,
+    Client, ClientOptions, Connection, ConnectionOptions, QueryRejectCondition, TlsOptions,
+    UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, WorkflowCancelOptions,
+    WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecutionDescription,
+    WorkflowExecutionInfo, WorkflowExecutionStatus, WorkflowFetchHistoryOptions,
+    WorkflowGetResultOptions, WorkflowHandle, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions, WorkflowTerminateOptions,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowStartError,
         WorkflowUpdateError,
@@ -29,10 +29,7 @@ use temporalio_common::protos::temporal::api::common::v1::{
     Header, Memo, Payload, Payloads, RetryPolicy,
     SearchAttributes as ProtoSearchAttributes,
 };
-use temporalio_common::protos::temporal::api::enums::v1::{
-    QueryRejectCondition, RetryState, TimeoutType,
-    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-};
+use temporalio_common::protos::temporal::api::enums::v1::{RetryState, TimeoutType};
 use temporalio_common::protos::temporal::api::failure::v1::{Failure, failure};
 use temporalio_common::telemetry::metrics::CoreMeter;
 use temporalio_common::telemetry::{
@@ -647,10 +644,12 @@ fn versioning_strategy_from_opts(opts: Term) -> anyhow::Result<WorkerVersioningS
 
     // v0.7.0 made WorkerDeploymentOptions #[non_exhaustive] with a bon
     // builder, so it can no longer be built with a struct literal.
-    let builder = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-        deployment_name,
-        build_id,
-    })
+    let builder = WorkerDeploymentOptions::new(
+        WorkerDeploymentVersion::builder()
+            .deployment_name(deployment_name)
+            .build_id(build_id)
+            .build(),
+    )
     .use_worker_versioning(use_worker_versioning);
 
     let options = match default_versioning_behavior {
@@ -919,6 +918,19 @@ fn start_workflow<'a>(
             return ok();
         }
     };
+    let start_signal = match start_signal_from_opts(opts) {
+        Ok(s) => s,
+        Err(err) => {
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_started(),
+                error_reason(env, invalid_options(), format!("{err:#}")),
+            );
+            return ok();
+        }
+    };
     let connection = client.connection.clone();
     let handle = client._runtime_handle.clone();
     let saved_env = OwnedEnv::new();
@@ -929,10 +941,25 @@ fn start_workflow<'a>(
             let client = Client::new(connection, ClientOptions::new(namespace.clone()).build())
                 .map_err(|err| StartWorkflowResult::Other(format!("{err:#}")))?;
             let workflow = UntypedWorkflow::new(workflow_type.clone());
-            let handle = client
-                .start_workflow(workflow, RawValue::new(vec![input_payload]), start_options)
-                .await
-                .map_err(StartWorkflowResult::Start)?;
+            let handle = match start_signal {
+                None => {
+                    client
+                        .start_workflow(workflow, RawValue::new(vec![input_payload]), start_options)
+                        .await
+                }
+                Some((signal_name, signal_payloads)) => {
+                    client
+                        .signal_with_start_workflow(
+                            workflow,
+                            RawValue::new(vec![input_payload]),
+                            UntypedSignal::<UntypedWorkflow>::new(signal_name),
+                            RawValue::new(signal_payloads),
+                            start_options,
+                        )
+                        .await
+                }
+            }
+            .map_err(StartWorkflowResult::Start)?;
             let run_id = handle.info().run_id.clone().unwrap_or_default();
             Ok::<_, StartWorkflowResult>((workflow_id, workflow_type, run_id))
         }
@@ -1359,10 +1386,12 @@ fn fetch_workflow_history(
         let result = async {
             let wf = untyped_handle(connection, namespace, workflow_id, run_id)
                 .map_err(WorkflowInteractionResult::Other)?;
-            let history = wf
+            let events = wf
                 .fetch_history(WorkflowFetchHistoryOptions::default())
+                .into_events()
                 .await
                 .map_err(WorkflowInteractionResult::Interaction)?;
+            let history = History { events };
             Ok::<_, WorkflowInteractionResult>(history)
         }
         .await;
@@ -1374,7 +1403,7 @@ fn fetch_workflow_history(
             workflow_history_fetched(),
             |env| match result {
                 Ok(history) => {
-                    let bytes = History::from(history).encode_to_vec();
+                    let bytes = history.encode_to_vec();
                     (ok(), binary_term(env, &bytes)).encode(env)
                 }
                 Err(err) => (error(), workflow_interaction_error_to_term(env, err)).encode(env),
@@ -1585,12 +1614,12 @@ fn untyped_handle(
     let client = Client::new(connection, ClientOptions::new(namespace.clone()).build())?;
     Ok(WorkflowHandle::<Client, UntypedWorkflow>::new(
         client,
-        WorkflowExecutionInfo {
-            namespace,
-            workflow_id,
-            run_id: run_id.clone(),
-            first_execution_run_id: run_id,
-        },
+        WorkflowExecutionInfo::builder()
+            .namespace(namespace)
+            .workflow_id(workflow_id)
+            .maybe_run_id(run_id.clone())
+            .maybe_first_execution_run_id(run_id)
+            .build(),
     ))
 }
 
@@ -2271,8 +2300,7 @@ fn workflow_start_options(
     opts: Term,
 ) -> anyhow::Result<WorkflowStartOptions> {
     let mut options = WorkflowStartOptions::new(task_queue, workflow_id).build();
-    options.id_reuse_policy = workflow_id_reuse_policy_from_opts(opts)?;
-    options.id_conflict_policy = workflow_id_conflict_policy_from_opts(opts)?;
+    (options.id_reuse_policy, options.id_conflict_policy) = workflow_id_policies_from_opts(opts)?;
     options.execution_timeout =
         duration_option_from_opts(opts, &[execution_timeout(), workflow_execution_timeout()])?;
     options.run_timeout =
@@ -2290,7 +2318,6 @@ fn workflow_start_options(
     // The client wraps the proto retry policy in its own type now; From is
     // the whole conversion, so our option decoding is unchanged.
     options.retry_policy = retry_policy_from_opts(opts)?.map(Into::into);
-    options.start_signal = start_signal_from_opts(opts)?;
     options.priority = priority_from_opts(opts)?;
     options.header = header_from_opts(opts)?;
     options.static_summary = keyword_get_string(opts, static_summary())?;
@@ -2298,7 +2325,7 @@ fn workflow_start_options(
     Ok(options)
 }
 
-fn start_signal_from_opts(opts: Term) -> anyhow::Result<Option<WorkflowStartSignal>> {
+fn start_signal_from_opts(opts: Term) -> anyhow::Result<Option<(String, Vec<Payload>)>> {
     let Some(term) = keyword_get_present(opts, start_signal())? else {
         return Ok(None);
     };
@@ -2307,15 +2334,12 @@ fn start_signal_from_opts(opts: Term) -> anyhow::Result<Option<WorkflowStartSign
         return Err(anyhow!("start_signal requires a name"));
     };
 
-    let mut signal = WorkflowStartSignal::new(signal_name).build();
-    signal.input = match keyword_get_present(term, args())? {
-        None => None,
-        Some(args) => Some(Payloads {
-            payloads: terms_list_to_payloads(args)?,
-        }),
+    let payloads = match keyword_get_present(term, args())? {
+        None => vec![],
+        Some(args) => terms_list_to_payloads(args)?,
     };
 
-    Ok(Some(signal))
+    Ok(Some((signal_name, payloads)))
 }
 
 fn signal_options(opts: Term) -> anyhow::Result<WorkflowSignalOptions> {
@@ -2463,25 +2487,58 @@ fn retry_policy_from_term(term: Term) -> anyhow::Result<RetryPolicy> {
     })
 }
 
-#[allow(deprecated)]
-fn workflow_id_reuse_policy_from_opts(opts: Term) -> anyhow::Result<WorkflowIdReusePolicy> {
+// The client API dropped the deprecated reuse policy TerminateIfRunning. Its
+// server-side equivalent is conflict policy TerminateExisting with reuse policy
+// AllowDuplicate, so `:terminate_if_running` keeps working as that pair.
+enum IdReusePolicy {
+    Policy(WorkflowIdReusePolicy),
+    TerminateIfRunning,
+}
+
+fn workflow_id_policies_from_opts(
+    opts: Term,
+) -> anyhow::Result<(WorkflowIdReusePolicy, WorkflowIdConflictPolicy)> {
+    let conflict = workflow_id_conflict_policy_from_opts(opts)?;
+
+    match workflow_id_reuse_policy_from_opts(opts)? {
+        IdReusePolicy::Policy(reuse) => Ok((reuse, conflict)),
+        IdReusePolicy::TerminateIfRunning => match conflict {
+            WorkflowIdConflictPolicy::Unspecified | WorkflowIdConflictPolicy::TerminateExisting => {
+                Ok((
+                    WorkflowIdReusePolicy::AllowDuplicate,
+                    WorkflowIdConflictPolicy::TerminateExisting,
+                ))
+            }
+            _ => Err(anyhow!(
+                "id_reuse_policy :terminate_if_running terminates the running workflow, \
+                 which contradicts the given id_conflict_policy"
+            )),
+        },
+    }
+}
+
+fn workflow_id_reuse_policy_from_opts(opts: Term) -> anyhow::Result<IdReusePolicy> {
     let Some(term) =
         keyword_get(opts, workflow_id_reuse_policy())?.or(keyword_get(opts, id_reuse_policy())?)
     else {
-        return Ok(WorkflowIdReusePolicy::Unspecified);
+        return Ok(IdReusePolicy::Policy(WorkflowIdReusePolicy::Unspecified));
     };
 
     let atom: Atom = decode_term(term)?;
     if atom == allow_duplicate() {
-        Ok(WorkflowIdReusePolicy::AllowDuplicate)
+        Ok(IdReusePolicy::Policy(WorkflowIdReusePolicy::AllowDuplicate))
     } else if atom == allow_duplicate_failed_only() {
-        Ok(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)
+        Ok(IdReusePolicy::Policy(
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+        ))
     } else if atom == reject_duplicate() {
-        Ok(WorkflowIdReusePolicy::RejectDuplicate)
+        Ok(IdReusePolicy::Policy(
+            WorkflowIdReusePolicy::RejectDuplicate,
+        ))
     } else if atom == terminate_if_running() {
-        Ok(WorkflowIdReusePolicy::TerminateIfRunning)
+        Ok(IdReusePolicy::TerminateIfRunning)
     } else if atom == unspecified() {
-        Ok(WorkflowIdReusePolicy::Unspecified)
+        Ok(IdReusePolicy::Policy(WorkflowIdReusePolicy::Unspecified))
     } else {
         Err(anyhow!("unsupported workflow id reuse policy"))
     }
