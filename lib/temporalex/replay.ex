@@ -140,9 +140,13 @@ defmodule Temporalex.Replay do
         backend_state = Temporalex.Server.backend_state(server)
         pushed = push_histories(backend_state, inputs)
         TemporalCore.replay_finish(backend_state)
+        # Wait for the server either way, so a push failure never returns while
+        # it is still replaying what was already pushed.
+        replayed = await_replay(server, ref, timeout)
+        evictions = collect_evictions(name)
 
-        with :ok <- pushed, :ok <- await_replay(server, ref, timeout) do
-          {:ok, outcomes(inputs, collect_evictions(name))}
+        with :ok <- pushed, :ok <- replayed do
+          {:ok, outcomes(inputs, evictions)}
         end
       end
     after
