@@ -99,7 +99,9 @@ create_runtime() :: {:ok, runtime} | {:error, term()}
 Connection:
 
 ```elixir
-connect(runtime, url, api_key, headers, pid) :: :ok
+connect(runtime, url, api_key, headers, tls, pid) :: :ok
+# tls: nil, or a keyword list of PEM binaries (:server_root_ca_cert,
+#   :client_cert, :client_private_key) and :domain
 # sends {:connected, client} | {:connect_error, reason}
 ```
 

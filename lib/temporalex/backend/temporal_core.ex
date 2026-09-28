@@ -88,9 +88,17 @@ defmodule Temporalex.Backend.TemporalCore do
     task_queue = Keyword.get(opts, :task_queue, @default_task_queue)
     connect_timeout = Keyword.get(opts, :connect_timeout, @default_connect_timeout)
 
-    with {:ok, runtime} <- Native.create_runtime(telemetry_opts(opts)),
+    with {:ok, tls} <- tls(opts),
+         {:ok, runtime} <- Native.create_runtime(telemetry_opts(opts)),
          :ok <-
-           Native.connect(runtime, target, Keyword.get(opts, :api_key), headers(opts), owner_pid),
+           Native.connect(
+             runtime,
+             target,
+             Keyword.get(opts, :api_key),
+             headers(opts),
+             tls,
+             owner_pid
+           ),
          {:ok, client} <- await_connection(connect_timeout) do
       {:ok,
        %ClientState{
@@ -518,6 +526,69 @@ defmodule Temporalex.Backend.TemporalCore do
       Keyword.get(opts, :url) ||
       Keyword.get(opts, :address) ||
       @default_target
+  end
+
+  # `:tls` is `true` for TLS against the system roots, or a keyword list of PEM
+  # material, each given inline or as a `_file` path, plus `:domain`, the server
+  # name to verify. Files are read here so the NIF only ever sees bytes.
+  @tls_pem_keys [:server_root_ca_cert, :client_cert, :client_private_key]
+
+  defp tls(opts) do
+    case Keyword.get(opts, :tls) do
+      nil ->
+        {:ok, nil}
+
+      false ->
+        {:ok, nil}
+
+      true ->
+        {:ok, []}
+
+      tls when is_list(tls) ->
+        read_tls(tls)
+
+      other ->
+        {:error,
+         {:invalid_options, ":tls must be true, false or a keyword list, got: #{inspect(other)}"}}
+    end
+  end
+
+  defp read_tls(tls) do
+    Enum.reduce_while(@tls_pem_keys, {:ok, Keyword.take(tls, [:domain])}, fn key, {:ok, acc} ->
+      case tls_pem(tls, key) do
+        {:ok, nil} -> {:cont, {:ok, acc}}
+        {:ok, pem} -> {:cont, {:ok, Keyword.put(acc, key, pem)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp tls_pem(tls, key) do
+    file_key = :"#{key}_file"
+
+    case {Keyword.get(tls, key), Keyword.get(tls, file_key)} do
+      {nil, nil} ->
+        {:ok, nil}
+
+      {pem, nil} when is_binary(pem) ->
+        {:ok, pem}
+
+      {nil, path} when is_binary(path) ->
+        read_tls_file(file_key, path)
+
+      _both_or_invalid ->
+        {:error, {:invalid_options, ":tls takes one of :#{key} or :#{file_key}, as a binary"}}
+    end
+  end
+
+  defp read_tls_file(file_key, path) do
+    case File.read(path) do
+      {:ok, pem} ->
+        {:ok, pem}
+
+      {:error, reason} ->
+        {:error, {:invalid_options, ":tls :#{file_key} #{path}: #{:file.format_error(reason)}"}}
+    end
   end
 
   # Metrics are opt-in: without `:prometheus` or `:otlp` the runtime starts with
