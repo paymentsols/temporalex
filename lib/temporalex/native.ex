@@ -72,6 +72,13 @@ defmodule Temporalex.Native do
 
   def monitor_worker(_worker), do: :erlang.nif_error(:nif_not_loaded)
 
+  def start_replay_worker(_runtime, _task_queue, _namespace, _pid, _poll_pid),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def replay_push(_feeder, _workflow_id, _bytes, _pid), do: :erlang.nif_error(:nif_not_loaded)
+
+  def replay_finish(_feeder), do: :erlang.nif_error(:nif_not_loaded)
+
   def start_workflow(
         _client,
         _namespace,

@@ -115,6 +115,23 @@ start_worker(
 # sends {:worker_started, worker} | {:worker_error, reason}
 ```
 
+Replay worker (sdk-core's replayer, fed recorded histories; no client):
+
+```elixir
+start_replay_worker(runtime, task_queue, namespace, pid, poll_pid) :: :ok
+# sends {:replay_worker_started, worker, feeder} | {:worker_error, reason}
+# starts only the workflow poll loop; the worker works with
+# complete_workflow_activation/3, initiate_shutdown/1 and shutdown_worker/2
+
+replay_push(feeder, workflow_id, history_bytes, pid) :: :ok | {:error, reason}
+# refuses bytes that are not a History with a run id in its started event;
+# sends {:replay_pushed, :ok | {:error, reason}} once the worker took it
+
+replay_finish(feeder) :: :ok
+# ends the history stream; after the last history the workflow poll loop
+# exits with {:poll_loop_exited, :workflow, :shutdown}
+```
+
 Poller counts and slot counts are different things. A poller fetches work from the
 task queue; a slot holds a task while that task is being executed. A workflow
 waiting on a timer or an update holds no slot: the workflow task completes when it

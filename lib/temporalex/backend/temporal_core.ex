@@ -48,6 +48,8 @@ defmodule Temporalex.Backend.TemporalCore do
       :task_queue,
       :start_timeout,
       :shutdown_timeout,
+      # Set only on a replay worker (start_replay_worker/2).
+      :replay_feeder,
       payload_codec: :etf
     ]
   end
@@ -163,6 +165,88 @@ defmodule Temporalex.Backend.TemporalCore do
     end
 
     result
+  end
+
+  @doc false
+  # A replay worker: sdk-core's replayer, fed recorded histories instead of a
+  # server, needing no client connection. The Server drives it exactly like a
+  # live worker; histories go in through replay_push/3 and replay_finish/1.
+  def start_replay_worker(opts, owner_pid) when is_list(opts) and is_pid(owner_pid) do
+    task_queue = Keyword.get(opts, :task_queue, "temporalex-replay")
+    namespace = Keyword.get(opts, :namespace, @default_namespace)
+    start_timeout = Keyword.get(opts, :start_timeout, @default_start_timeout)
+
+    with {:ok, runtime} <- Native.create_runtime(telemetry_opts([])) do
+      {:ok, poller_bridge} = PollerBridge.start(owner_pid)
+
+      result =
+        with :ok <-
+               Native.start_replay_worker(
+                 runtime,
+                 task_queue,
+                 namespace,
+                 owner_pid,
+                 poller_bridge
+               ),
+             {:ok, worker, feeder} <- await_replay_worker(start_timeout) do
+          {:ok,
+           %WorkerState{
+             runtime: runtime,
+             worker: worker,
+             replay_feeder: feeder,
+             poller_bridge: poller_bridge,
+             owner_pid: owner_pid,
+             namespace: namespace,
+             task_queue: task_queue,
+             start_timeout: start_timeout,
+             shutdown_timeout: Keyword.get(opts, :shutdown_timeout, @default_shutdown_timeout),
+             payload_codec: payload_codec_from_opts(opts)
+           }}
+        else
+          {:error, reason} ->
+            {:error, Error.normalize_client_reason(reason, operation: :start_worker)}
+        end
+
+      if match?({:error, _reason}, result) do
+        send(poller_bridge, :stop)
+      end
+
+      result
+    end
+  end
+
+  @doc false
+  # Queue one history and wait until the replay worker has taken it, so
+  # histories go in one at a time and in order.
+  def replay_push(%WorkerState{replay_feeder: feeder, start_timeout: timeout}, workflow_id, bytes)
+      when is_binary(workflow_id) and is_binary(bytes) do
+    case Native.replay_push(feeder, workflow_id, bytes, self()) do
+      :ok ->
+        receive do
+          {:replay_pushed, result} -> result
+        after
+          timeout -> {:error, {:replay_push_timeout, timeout}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc false
+  def replay_finish(%WorkerState{replay_feeder: feeder}), do: Native.replay_finish(feeder)
+
+  defp await_replay_worker(timeout) do
+    receive do
+      {:replay_worker_started, worker, feeder} ->
+        :ok = Native.monitor_worker(worker)
+        {:ok, worker, feeder}
+
+      {:worker_error, reason} ->
+        {:error, {:worker_error, reason}}
+    after
+      timeout -> {:error, {:worker_start_timeout, timeout}}
+    end
   end
 
   @impl Temporalex.Backend

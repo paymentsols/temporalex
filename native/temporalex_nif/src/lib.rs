@@ -41,9 +41,10 @@ use temporalio_common::worker::{
     VersioningBehavior as WorkerVersioningBehavior, WorkerDeploymentOptions,
     WorkerDeploymentVersion, WorkerTaskTypes,
 };
+use temporalio_sdk_core::replay::{HistoryFeeder, HistoryForReplay, ReplayWorkerInput};
 use temporalio_sdk_core::{
     CoreRuntime, PollError, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, Worker,
-    WorkerConfig, WorkerVersioningStrategy, init_worker,
+    WorkerConfig, WorkerVersioningStrategy, init_replay_worker, init_worker,
 };
 use url::Url;
 
@@ -51,6 +52,8 @@ rustler::atoms! {
     ok,
     error,
     nil,
+    replay_worker_started,
+    replay_pushed,
     connected,
     connect_error,
     worker_started,
@@ -251,6 +254,16 @@ impl Drop for WorkerResource {
         schedule_worker_shutdown(self.worker.clone(), self.runtime_handle.clone());
     }
 }
+
+/// Feeds recorded histories to a replay worker. Taking the feeder out (by
+/// `replay_finish`, or when the resource is dropped) ends the history stream,
+/// and the replay worker then shuts its poller down.
+pub struct ReplayFeederResource {
+    feeder: std::sync::Mutex<Option<Arc<HistoryFeeder>>>,
+    runtime_handle: tokio::runtime::Handle,
+}
+
+impl Resource for ReplayFeederResource {}
 
 struct TaskGuard {
     pid: LocalPid,
@@ -792,6 +805,123 @@ fn start_worker<'a>(
     });
 
     ok().encode(env)
+}
+
+/// Start a replay worker: sdk-core's own replayer, fed recorded histories
+/// instead of a server. Its activations go through the same Elixir path as a
+/// live worker's (the poller bridge, the Server, the executors). Replay only
+/// runs workflows, so only the workflow poll loop is started. Sends
+/// `{:replay_worker_started, worker, feeder}` or `{:worker_error, reason}` to
+/// `pid`.
+#[rustler::nif]
+fn start_replay_worker(
+    runtime: ResourceArc<RuntimeResource>,
+    task_queue: String,
+    namespace: String,
+    pid: LocalPid,
+    poll_pid: LocalPid,
+) -> Atom {
+    let handle = runtime.core.tokio_handle();
+    let runtime_for_worker = runtime.clone();
+
+    handle.clone().spawn(async move {
+        let guard = TaskGuard::new(pid, GuardFailure::WorkerStart);
+        let result = async {
+            // Replay overrides the pollers, the cache size and the task types
+            // itself; these are the fields it leaves to us.
+            let config = WorkerConfig::builder()
+                .namespace(namespace)
+                .task_queue(task_queue)
+                .versioning_strategy(WorkerVersioningStrategy::None {
+                    build_id: "temporalex-replay".to_string(),
+                })
+                .task_types(WorkerTaskTypes::workflow_only())
+                .build()
+                .map_err(|err| anyhow!(err))?;
+
+            let (feeder, histories) = HistoryFeeder::new(1);
+            let worker = init_replay_worker(ReplayWorkerInput::new(config, histories))?;
+            worker.validate().await?;
+            Ok::<_, anyhow::Error>((worker, feeder))
+        }
+        .await;
+
+        match result {
+            Ok((worker, feeder)) => {
+                let worker = ResourceArc::new(WorkerResource {
+                    worker: Arc::new(worker),
+                    runtime_handle: handle.clone(),
+                    _runtime: runtime_for_worker,
+                });
+                let feeder = ResourceArc::new(ReplayFeederResource {
+                    feeder: std::sync::Mutex::new(Some(Arc::new(feeder))),
+                    runtime_handle: handle.clone(),
+                });
+
+                start_workflow_poll_loop(worker.clone(), poll_pid);
+                send_simple(&pid, |env| {
+                    (replay_worker_started(), worker, feeder).encode(env)
+                });
+            }
+            Err(err) => {
+                send_simple(&pid, |env| (worker_error(), format!("{err:#}")).encode(env));
+            }
+        }
+
+        guard.complete();
+    });
+
+    ok()
+}
+
+/// Queue one recorded history (raw `temporal.api.history.v1.History` bytes)
+/// for replay. Bad bytes are refused here: core panics on a history whose
+/// started event has no run id. Otherwise returns `:ok` and later sends
+/// `{:replay_pushed, :ok | {:error, reason}}` to `pid` once the replay worker
+/// has taken the history, so the caller feeds histories one at a time and in
+/// order.
+#[rustler::nif]
+fn replay_push<'a>(
+    env: Env<'a>,
+    feeder: ResourceArc<ReplayFeederResource>,
+    workflow_id: String,
+    bytes: Binary,
+    pid: LocalPid,
+) -> Term<'a> {
+    let history = match History::decode(bytes.as_slice()) {
+        Ok(history) => history,
+        Err(err) => return (error(), format!("undecodable history: {err}")).encode(env),
+    };
+    if let Err(err) = history.extract_run_id_from_start() {
+        return (
+            error(),
+            format!("history has no run id in its started event: {err:#}"),
+        )
+            .encode(env);
+    }
+    let Some(history_feeder) = feeder.feeder.lock().unwrap().clone() else {
+        return (error(), "replay already finished").encode(env);
+    };
+
+    feeder.runtime_handle.spawn(async move {
+        let result = history_feeder
+            .feed(HistoryForReplay::new(history, workflow_id))
+            .await;
+        send_simple(&pid, |env| match result {
+            Ok(()) => (replay_pushed(), ok()).encode(env),
+            Err(err) => (replay_pushed(), (error(), format!("{err:#}"))).encode(env),
+        });
+    });
+
+    ok().encode(env)
+}
+
+/// End the history stream. Once the last history has been replayed, the
+/// replay worker shuts down and the workflow poll loop exits with `:shutdown`.
+#[rustler::nif]
+fn replay_finish(feeder: ResourceArc<ReplayFeederResource>) -> Atom {
+    feeder.feeder.lock().unwrap().take();
+    ok()
 }
 
 #[rustler::nif]
@@ -1503,6 +1633,11 @@ fn schedule_worker_shutdown(worker: Arc<Worker>, handle: tokio::runtime::Handle)
 }
 
 fn start_poll_loops(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
+    start_workflow_poll_loop(worker.clone(), pid);
+    start_activity_poll_loop(worker, pid);
+}
+
+fn start_workflow_poll_loop(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
     let workflow_worker = worker.clone();
     let workflow_pid = pid;
     worker.runtime_handle.spawn(async move {
@@ -1527,7 +1662,9 @@ fn start_poll_loops(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
             }
         }
     });
+}
 
+fn start_activity_poll_loop(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
     let activity_worker = worker.clone();
     let activity_pid = pid;
     worker.runtime_handle.spawn(async move {
@@ -2641,6 +2778,7 @@ fn on_load(env: Env, _load_info: Term) -> bool {
     env.register::<RuntimeResource>().is_ok()
         && env.register::<ClientResource>().is_ok()
         && env.register::<WorkerResource>().is_ok()
+        && env.register::<ReplayFeederResource>().is_ok()
 }
 
 rustler::init!("Elixir.Temporalex.Native", load = on_load);
