@@ -116,6 +116,16 @@ defmodule Temporalex.TestingTest do
     def run(reason), do: {:error, reason}
   end
 
+  defmodule PatchedWorkflow do
+    use Temporalex.Workflow
+
+    def run(value) do
+      path = if API.patched?("new-path"), do: :new, else: :old
+      {:ok, result} = Activities.echo({path, value})
+      {:ok, result}
+    end
+  end
+
   test "activity commands are asserted and completed through operation handles" do
     assert {:ok, run} = start_workflow(ActivityWorkflow, :value)
 
@@ -143,6 +153,17 @@ defmodule Temporalex.TestingTest do
     fail_activity(run, activity, :activity_failed)
 
     assert_failed(run)
+    assert_replay(run)
+  end
+
+  test "replay delivers the patch markers the run recorded" do
+    assert {:ok, run} = start_workflow(PatchedWorkflow, :value)
+
+    assert %Command.SetPatchMarker{id: "new-path", deprecated: false} = assert_next_command(run)
+    activity = assert_next_activity(run, type: {Activities, :echo}, input: [{:new, :value}])
+    complete_activity(run, activity, {:ok, :done})
+
+    assert_completed(run, :done)
     assert_replay(run)
   end
 

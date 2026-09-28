@@ -515,10 +515,19 @@ defmodule Temporalex.Testing.Runner do
       |> Keyword.put(:replay, true)
       |> Keyword.put(:expected_commands, step.commands)
 
-    case TestHarness.activate(harness, step.jobs, opts) do
+    case TestHarness.activate(harness, replay_jobs(step), opts) do
       {:failed, reason} -> {:halt, {:error, reason}}
       _step -> {:cont, :ok}
     end
+  end
+
+  # On replay, core tells the workflow which patches its history already holds,
+  # with a NotifyHasPatch job delivered before the code that calls patched?/1
+  # runs. The live run recorded SetPatchMarker commands instead, so replay turns
+  # each one back into the notification it stands for.
+  defp replay_jobs(%{jobs: jobs, commands: commands}) do
+    patches = for %Command.SetPatchMarker{id: id} <- commands, do: %Job.NotifyPatch{id: id}
+    patches ++ jobs
   end
 
   defp activation_opts(opts) do
