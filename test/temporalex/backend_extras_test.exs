@@ -8,6 +8,7 @@ defmodule Temporalex.BackendExtrasTest do
   use ExUnit.Case, async: false
 
   alias Temporalex.Backend.TemporalCore.Codec
+  alias Temporalex.Backend.TemporalCore.Proto.Schema
   alias Temporalex.Core.ActivityCompletion
   alias Temporalex.Core.Command
   alias Temporalex.Core.Completion
@@ -28,7 +29,7 @@ defmodule Temporalex.BackendExtrasTest do
       assert {:ok, bytes} = Codec.workflow_completion_to_bytes(completion, task_queue: "q")
 
       assert {:ok, %{status: {:failed, failed}}} =
-               Temporalex.Backend.TemporalCore.Proto.Schema.decode(bytes, @completion)
+               Schema.decode(bytes, @completion)
 
       # proto3 omits a field at its default, UNSPECIFIED
       cause = Map.get(failed, :force_cause, :WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED)
@@ -45,7 +46,7 @@ defmodule Temporalex.BackendExtrasTest do
       assert {:ok, bytes} = Codec.workflow_completion_to_bytes(completion, task_queue: "q")
 
       assert {:ok, %{status: {:failed, failed}}} =
-               Temporalex.Backend.TemporalCore.Proto.Schema.decode(bytes, @completion)
+               Schema.decode(bytes, @completion)
 
       # proto3 omits a field at its default, UNSPECIFIED
       cause = Map.get(failed, :force_cause, :WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED)
