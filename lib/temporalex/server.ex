@@ -583,16 +583,7 @@ defmodule Temporalex.Server do
   end
 
   defp workflow_map(workflows) do
-    Map.new(workflows, fn workflow ->
-      type =
-        if function_exported?(workflow, :__workflow_type__, 0) do
-          workflow.__workflow_type__()
-        else
-          inspect(workflow)
-        end
-
-      {type, workflow}
-    end)
+    Map.new(workflows, fn workflow -> {Temporalex.Workflow.wire_type(workflow), workflow} end)
   end
 
   defp activity_map(activities) do

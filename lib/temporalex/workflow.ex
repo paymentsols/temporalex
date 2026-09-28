@@ -201,6 +201,20 @@ defmodule Temporalex.Workflow do
   end
 
   @doc false
+  # The wire type of a workflow module. Loads the module first: outside a
+  # release (dev, tests, `mix run` scripts) modules load lazily, and an
+  # unloaded module fails function_exported?/3, which would fall back to the
+  # Elixir module name and start, register or replay the wrong type.
+  @spec wire_type(module()) :: String.t()
+  def wire_type(module) when is_atom(module) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :__workflow_type__, 0) do
+      module.__workflow_type__()
+    else
+      inspect(module)
+    end
+  end
+
+  @doc false
   def __signal__(module, address, name, payload, opts) do
     workflow_id = Start.resolve_address!(module, address)
     args = if is_nil(payload), do: [], else: [payload]
