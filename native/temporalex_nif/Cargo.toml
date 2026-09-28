@@ -8,6 +8,11 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# DSF spike only (G2 battery row 17): `debug_arm_fault/2` arms a one-shot panic
+# or abort in the NIF glue. Never enabled in a normal build.
+fault-injection = []
+
 [dependencies]
 anyhow = "1"
 prost = "0.14"

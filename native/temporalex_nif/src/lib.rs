@@ -49,6 +49,49 @@ use temporalio_sdk_core::{
 };
 use url::Url;
 
+/// DSF spike only (G2 battery row 17): one-shot faults in the NIF glue, armed
+/// from Elixir with `debug_arm_fault/2`, fired at the next pass through a site.
+#[cfg(feature = "fault-injection")]
+mod fault {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    pub static ARMED: AtomicU8 = AtomicU8::new(0);
+    pub const PANIC_COMPLETION: u8 = 1;
+    pub const ABORT_COMPLETION: u8 = 2;
+    pub const PANIC_POLL: u8 = 3;
+    pub const ABORT_POLL: u8 = 4;
+
+    pub fn fire(panic_code: u8, abort_code: u8, site: &str) {
+        if ARMED
+            .compare_exchange(panic_code, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            panic!("temporalex fault injection: panic in {site}");
+        }
+        if ARMED
+            .compare_exchange(abort_code, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            eprintln!("temporalex fault injection: abort in {site}");
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[rustler::nif]
+fn debug_arm_fault(kind: Term, site: Term) -> rustler::NifResult<Atom> {
+    let code = match (kind.atom_to_string()?.as_str(), site.atom_to_string()?.as_str()) {
+        ("panic", "completion") => fault::PANIC_COMPLETION,
+        ("abort", "completion") => fault::ABORT_COMPLETION,
+        ("panic", "poll") => fault::PANIC_POLL,
+        ("abort", "poll") => fault::ABORT_POLL,
+        _ => return Err(rustler::Error::BadArg),
+    };
+    fault::ARMED.store(code, std::sync::atomic::Ordering::SeqCst);
+    Ok(ok())
+}
+
 rustler::atoms! {
     ok,
     error,
@@ -940,6 +983,12 @@ fn complete_workflow_activation(
     bytes: Binary,
     pid: LocalPid,
 ) -> Atom {
+    #[cfg(feature = "fault-injection")]
+    fault::fire(
+        fault::PANIC_COMPLETION,
+        fault::ABORT_COMPLETION,
+        "complete_workflow_activation (NIF call)",
+    );
     let bytes = bytes.as_slice().to_vec();
     let handle = worker.runtime_handle.clone();
     let worker_ref = worker.worker.clone();
@@ -1711,6 +1760,8 @@ fn start_workflow_poll_loop(worker: ResourceArc<WorkerResource>, pid: LocalPid) 
         loop {
             match workflow_worker.worker.poll_workflow_activation().await {
                 Ok(activation) => {
+                    #[cfg(feature = "fault-injection")]
+                    fault::fire(fault::PANIC_POLL, fault::ABORT_POLL, "workflow poll task");
                     let bytes = activation.encode_to_vec();
                     send_simple(&workflow_pid, |env| {
                         (workflow_activation(), binary_term(env, &bytes)).encode(env)

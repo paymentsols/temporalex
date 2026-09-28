@@ -32,11 +32,20 @@ defmodule Temporalex.Native do
                         aarch64-unknown-linux-musl
                         x86_64-unknown-linux-musl
                       )
-                    ] ++ if(@force_build, do: [force_build: true], else: [])
+                    ] ++
+                      if(@force_build, do: [force_build: true], else: []) ++
+                      if(System.get_env("TEMPORALEX_NIF_FEATURES") in [nil, ""],
+                        do: [],
+                        else: [features: String.split(System.get_env("TEMPORALEX_NIF_FEATURES"), ",")]
+                      )
 
   use RustlerPrecompiled, @precompiled_opts
 
   def create_runtime(_telemetry_opts), do: :erlang.nif_error(:nif_not_loaded)
+
+  # DSF spike only (G2 row 17); present only in a build with the
+  # `fault-injection` cargo feature (TEMPORALEX_NIF_FEATURES=fault-injection).
+  def debug_arm_fault(_kind, _site), do: :erlang.nif_error(:nif_not_loaded)
 
   def connect(_runtime, _url, _api_key, _headers, _tls, _pid),
     do: :erlang.nif_error(:nif_not_loaded)
