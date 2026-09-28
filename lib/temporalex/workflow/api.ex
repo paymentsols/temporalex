@@ -84,11 +84,8 @@ defmodule Temporalex.Workflow.API do
         is_binary(workflow) ->
           workflow
 
-        is_atom(workflow) and function_exported?(workflow, :__workflow_type__, 0) ->
-          workflow.__workflow_type__()
-
         is_atom(workflow) ->
-          inspect(workflow)
+          Temporalex.Workflow.wire_type(workflow)
       end
 
     unwrap_op(%Op.ExecuteChildWorkflow{workflow_type: type, input: input, opts: opts})
@@ -110,11 +107,8 @@ defmodule Temporalex.Workflow.API do
         is_binary(workflow) ->
           workflow
 
-        is_atom(workflow) and function_exported?(workflow, :__workflow_type__, 0) ->
-          workflow.__workflow_type__()
-
         is_atom(workflow) ->
-          inspect(workflow)
+          Temporalex.Workflow.wire_type(workflow)
       end
 
     unwrap_op(%Op.StartChildWorkflow{workflow_type: type, input: input, opts: opts})
@@ -403,13 +397,8 @@ defmodule Temporalex.Workflow.API do
 
   defp normalize_workflow_type!(workflow_type) when is_binary(workflow_type), do: workflow_type
 
-  defp normalize_workflow_type!(workflow_module) when is_atom(workflow_module) do
-    if function_exported?(workflow_module, :__workflow_type__, 0) do
-      workflow_module.__workflow_type__()
-    else
-      inspect(workflow_module)
-    end
-  end
+  defp normalize_workflow_type!(workflow_module) when is_atom(workflow_module),
+    do: Temporalex.Workflow.wire_type(workflow_module)
 
   defp normalize_payload_map_option!(nil), do: %{}
 

@@ -679,11 +679,6 @@ defmodule Temporalex.Client do
 
   defp workflow_type(workflow_type) when is_binary(workflow_type), do: workflow_type
 
-  defp workflow_type(workflow_module) when is_atom(workflow_module) do
-    if function_exported?(workflow_module, :__workflow_type__, 0) do
-      workflow_module.__workflow_type__()
-    else
-      inspect(workflow_module)
-    end
-  end
+  defp workflow_type(workflow_module) when is_atom(workflow_module),
+    do: Temporalex.Workflow.wire_type(workflow_module)
 end

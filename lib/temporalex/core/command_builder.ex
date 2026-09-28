@@ -219,13 +219,8 @@ defmodule Temporalex.Core.CommandBuilder do
   defp normalize_workflow_type(workflow_type) when is_binary(workflow_type),
     do: {:ok, workflow_type}
 
-  defp normalize_workflow_type(workflow_module) when is_atom(workflow_module) do
-    if function_exported?(workflow_module, :__workflow_type__, 0) do
-      {:ok, workflow_module.__workflow_type__()}
-    else
-      {:ok, inspect(workflow_module)}
-    end
-  end
+  defp normalize_workflow_type(workflow_module) when is_atom(workflow_module),
+    do: {:ok, Temporalex.Workflow.wire_type(workflow_module)}
 
   defp normalize_workflow_type(_workflow_type) do
     validation_error("continue_as_new! workflow_type must be a string or workflow module")

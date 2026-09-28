@@ -542,12 +542,7 @@ defmodule Temporalex.Testing.Runner do
   end
 
   defp initialize_job(harness, opts) do
-    workflow_type =
-      if function_exported?(harness.workflow_module, :__workflow_type__, 0) do
-        harness.workflow_module.__workflow_type__()
-      else
-        inspect(harness.workflow_module)
-      end
+    workflow_type = Temporalex.Workflow.wire_type(harness.workflow_module)
 
     %Job.InitializeWorkflow{
       workflow_type: workflow_type,
