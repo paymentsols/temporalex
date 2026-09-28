@@ -78,6 +78,7 @@ defmodule Temporalex.TemporalClientSemanticsTest do
 
     try do
       assert_running_workflow_conflicts(client_name)
+      assert_terminate_if_running(client_name)
       assert_closed_workflow_reuse(client_name)
       assert_not_found_errors(client_name)
       assert_query_reject_condition(client_name)
@@ -138,6 +139,48 @@ defmodule Temporalex.TemporalClientSemanticsTest do
 
     assert :ok = Client.signal_workflow(first, "finish", [], timeout: 10_000)
     assert {:ok, {:finished, :conflict}} = Client.get_result(first, timeout: 30_000)
+  end
+
+  # The client API no longer has the reuse policy TerminateIfRunning. The NIF
+  # sends its server-side equivalent (conflict policy TerminateExisting with
+  # reuse policy AllowDuplicate), so :terminate_if_running still replaces a
+  # running run, and contradicting it with another conflict policy is refused.
+  defp assert_terminate_if_running(client_name) do
+    workflow_id = unique_workflow_id("terminate")
+
+    assert {:ok, first} =
+             Client.start_workflow(client_name, GateWorkflow, :first,
+               workflow_id: workflow_id,
+               timeout: 10_000
+             )
+
+    assert TemporalDevServer.eventually(fn ->
+             Client.query_workflow(first, "state", [], timeout: 10_000) ==
+               {:ok, {:waiting, :first}}
+           end)
+
+    assert {:ok, second} =
+             Client.start_workflow(client_name, GateWorkflow, :second,
+               workflow_id: workflow_id,
+               id_reuse_policy: :terminate_if_running,
+               timeout: 10_000
+             )
+
+    assert second.run_id != first.run_id
+
+    assert {:error, %Temporalex.WorkflowTerminatedError{}} =
+             Client.get_result(first, timeout: 30_000)
+
+    assert {:error, _invalid_options} =
+             Client.start_workflow(client_name, GateWorkflow, :third,
+               workflow_id: workflow_id,
+               id_reuse_policy: :terminate_if_running,
+               id_conflict_policy: :use_existing,
+               timeout: 10_000
+             )
+
+    assert :ok = Client.signal_workflow(second, "finish", [], timeout: 10_000)
+    assert {:ok, {:finished, :second}} = Client.get_result(second, timeout: 30_000)
   end
 
   defp assert_closed_workflow_reuse(client_name) do

@@ -38,7 +38,7 @@ defmodule Temporalex.Native do
 
   def create_runtime(_telemetry_opts), do: :erlang.nif_error(:nif_not_loaded)
 
-  def connect(_runtime, _url, _api_key, _headers, _pid),
+  def connect(_runtime, _url, _api_key, _headers, _tls, _pid),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def start_worker(
@@ -71,6 +71,13 @@ defmodule Temporalex.Native do
   def shutdown_worker(_worker, _pid), do: :erlang.nif_error(:nif_not_loaded)
 
   def monitor_worker(_worker), do: :erlang.nif_error(:nif_not_loaded)
+
+  def start_replay_worker(_runtime, _task_queue, _namespace, _pid, _poll_pid),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def replay_push(_feeder, _workflow_id, _bytes, _pid), do: :erlang.nif_error(:nif_not_loaded)
+
+  def replay_finish(_feeder), do: :erlang.nif_error(:nif_not_loaded)
 
   def start_workflow(
         _client,

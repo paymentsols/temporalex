@@ -48,6 +48,8 @@ defmodule Temporalex.Backend.TemporalCore do
       :task_queue,
       :start_timeout,
       :shutdown_timeout,
+      # Set only on a replay worker (start_replay_worker/2).
+      :replay_feeder,
       payload_codec: :etf
     ]
   end
@@ -86,9 +88,17 @@ defmodule Temporalex.Backend.TemporalCore do
     task_queue = Keyword.get(opts, :task_queue, @default_task_queue)
     connect_timeout = Keyword.get(opts, :connect_timeout, @default_connect_timeout)
 
-    with {:ok, runtime} <- Native.create_runtime(telemetry_opts(opts)),
+    with {:ok, tls} <- tls(opts),
+         {:ok, runtime} <- Native.create_runtime(telemetry_opts(opts)),
          :ok <-
-           Native.connect(runtime, target, Keyword.get(opts, :api_key), headers(opts), owner_pid),
+           Native.connect(
+             runtime,
+             target,
+             Keyword.get(opts, :api_key),
+             headers(opts),
+             tls,
+             owner_pid
+           ),
          {:ok, client} <- await_connection(connect_timeout) do
       {:ok,
        %ClientState{
@@ -163,6 +173,88 @@ defmodule Temporalex.Backend.TemporalCore do
     end
 
     result
+  end
+
+  @doc false
+  # A replay worker: sdk-core's replayer, fed recorded histories instead of a
+  # server, needing no client connection. The Server drives it exactly like a
+  # live worker; histories go in through replay_push/3 and replay_finish/1.
+  def start_replay_worker(opts, owner_pid) when is_list(opts) and is_pid(owner_pid) do
+    task_queue = Keyword.get(opts, :task_queue, "temporalex-replay")
+    namespace = Keyword.get(opts, :namespace, @default_namespace)
+    start_timeout = Keyword.get(opts, :start_timeout, @default_start_timeout)
+
+    with {:ok, runtime} <- Native.create_runtime(telemetry_opts([])) do
+      {:ok, poller_bridge} = PollerBridge.start(owner_pid)
+
+      result =
+        with :ok <-
+               Native.start_replay_worker(
+                 runtime,
+                 task_queue,
+                 namespace,
+                 owner_pid,
+                 poller_bridge
+               ),
+             {:ok, worker, feeder} <- await_replay_worker(start_timeout) do
+          {:ok,
+           %WorkerState{
+             runtime: runtime,
+             worker: worker,
+             replay_feeder: feeder,
+             poller_bridge: poller_bridge,
+             owner_pid: owner_pid,
+             namespace: namespace,
+             task_queue: task_queue,
+             start_timeout: start_timeout,
+             shutdown_timeout: Keyword.get(opts, :shutdown_timeout, @default_shutdown_timeout),
+             payload_codec: payload_codec_from_opts(opts)
+           }}
+        else
+          {:error, reason} ->
+            {:error, Error.normalize_client_reason(reason, operation: :start_worker)}
+        end
+
+      if match?({:error, _reason}, result) do
+        send(poller_bridge, :stop)
+      end
+
+      result
+    end
+  end
+
+  @doc false
+  # Queue one history and wait until the replay worker has taken it, so
+  # histories go in one at a time and in order.
+  def replay_push(%WorkerState{replay_feeder: feeder, start_timeout: timeout}, workflow_id, bytes)
+      when is_binary(workflow_id) and is_binary(bytes) do
+    case Native.replay_push(feeder, workflow_id, bytes, self()) do
+      :ok ->
+        receive do
+          {:replay_pushed, result} -> result
+        after
+          timeout -> {:error, {:replay_push_timeout, timeout}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc false
+  def replay_finish(%WorkerState{replay_feeder: feeder}), do: Native.replay_finish(feeder)
+
+  defp await_replay_worker(timeout) do
+    receive do
+      {:replay_worker_started, worker, feeder} ->
+        :ok = Native.monitor_worker(worker)
+        {:ok, worker, feeder}
+
+      {:worker_error, reason} ->
+        {:error, {:worker_error, reason}}
+    after
+      timeout -> {:error, {:worker_start_timeout, timeout}}
+    end
   end
 
   @impl Temporalex.Backend
@@ -434,6 +526,69 @@ defmodule Temporalex.Backend.TemporalCore do
       Keyword.get(opts, :url) ||
       Keyword.get(opts, :address) ||
       @default_target
+  end
+
+  # `:tls` is `true` for TLS against the system roots, or a keyword list of PEM
+  # material, each given inline or as a `_file` path, plus `:domain`, the server
+  # name to verify. Files are read here so the NIF only ever sees bytes.
+  @tls_pem_keys [:server_root_ca_cert, :client_cert, :client_private_key]
+
+  defp tls(opts) do
+    case Keyword.get(opts, :tls) do
+      nil ->
+        {:ok, nil}
+
+      false ->
+        {:ok, nil}
+
+      true ->
+        {:ok, []}
+
+      tls when is_list(tls) ->
+        read_tls(tls)
+
+      other ->
+        {:error,
+         {:invalid_options, ":tls must be true, false or a keyword list, got: #{inspect(other)}"}}
+    end
+  end
+
+  defp read_tls(tls) do
+    Enum.reduce_while(@tls_pem_keys, {:ok, Keyword.take(tls, [:domain])}, fn key, {:ok, acc} ->
+      case tls_pem(tls, key) do
+        {:ok, nil} -> {:cont, {:ok, acc}}
+        {:ok, pem} -> {:cont, {:ok, Keyword.put(acc, key, pem)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp tls_pem(tls, key) do
+    file_key = :"#{key}_file"
+
+    case {Keyword.get(tls, key), Keyword.get(tls, file_key)} do
+      {nil, nil} ->
+        {:ok, nil}
+
+      {pem, nil} when is_binary(pem) ->
+        {:ok, pem}
+
+      {nil, path} when is_binary(path) ->
+        read_tls_file(file_key, path)
+
+      _both_or_invalid ->
+        {:error, {:invalid_options, ":tls takes one of :#{key} or :#{file_key}, as a binary"}}
+    end
+  end
+
+  defp read_tls_file(file_key, path) do
+    case File.read(path) do
+      {:ok, pem} ->
+        {:ok, pem}
+
+      {:error, reason} ->
+        {:error, {:invalid_options, ":tls :#{file_key} #{path}: #{:file.format_error(reason)}"}}
+    end
   end
 
   # Metrics are opt-in: without `:prometheus` or `:otlp` the runtime starts with

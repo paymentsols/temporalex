@@ -8,12 +8,13 @@ use serde_json::{Number as JsonNumber, Value as JsonValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, TlsOptions, UntypedQuery, UntypedSignal,
-    UntypedUpdate, UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions,
-    WorkflowExecuteUpdateOptions, WorkflowExecutionDescription, WorkflowExecutionInfo,
-    WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowHandle,
-    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions, WorkflowStartSignal,
-    WorkflowTerminateOptions,
+    Client, ClientOptions, ClientTlsOptions, Connection, ConnectionOptions, QueryRejectCondition,
+    TlsOptions, UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow,
+    WorkflowCancelOptions, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
+    WorkflowExecutionDescription, WorkflowExecutionInfo, WorkflowExecutionStatus,
+    WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowHandle,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowQueryOptions, WorkflowSignalOptions,
+    WorkflowStartOptions, WorkflowTerminateOptions,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowStartError,
         WorkflowUpdateError,
@@ -29,10 +30,7 @@ use temporalio_common::protos::temporal::api::common::v1::{
     Header, Memo, Payload, Payloads, RetryPolicy,
     SearchAttributes as ProtoSearchAttributes,
 };
-use temporalio_common::protos::temporal::api::enums::v1::{
-    QueryRejectCondition, RetryState, TimeoutType,
-    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-};
+use temporalio_common::protos::temporal::api::enums::v1::{RetryState, TimeoutType};
 use temporalio_common::protos::temporal::api::failure::v1::{Failure, failure};
 use temporalio_common::telemetry::metrics::CoreMeter;
 use temporalio_common::telemetry::{
@@ -44,9 +42,10 @@ use temporalio_common::worker::{
     VersioningBehavior as WorkerVersioningBehavior, WorkerDeploymentOptions,
     WorkerDeploymentVersion, WorkerTaskTypes,
 };
+use temporalio_sdk_core::replay::{HistoryFeeder, HistoryForReplay, ReplayWorkerInput};
 use temporalio_sdk_core::{
     CoreRuntime, PollError, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, Worker,
-    WorkerConfig, WorkerVersioningStrategy, init_worker,
+    WorkerConfig, WorkerVersioningStrategy, init_replay_worker, init_worker,
 };
 use url::Url;
 
@@ -54,8 +53,14 @@ rustler::atoms! {
     ok,
     error,
     nil,
+    replay_worker_started,
+    replay_pushed,
     connected,
     connect_error,
+    server_root_ca_cert,
+    client_cert,
+    client_private_key,
+    domain,
     worker_started,
     worker_error,
     workflow_activation,
@@ -254,6 +259,16 @@ impl Drop for WorkerResource {
         schedule_worker_shutdown(self.worker.clone(), self.runtime_handle.clone());
     }
 }
+
+/// Feeds recorded histories to a replay worker. Taking the feeder out (by
+/// `replay_finish`, or when the resource is dropped) ends the history stream,
+/// and the replay worker then shuts its poller down.
+pub struct ReplayFeederResource {
+    feeder: std::sync::Mutex<Option<Arc<HistoryFeeder>>>,
+    runtime_handle: tokio::runtime::Handle,
+}
+
+impl Resource for ReplayFeederResource {}
 
 struct TaskGuard {
     pid: LocalPid,
@@ -541,11 +556,12 @@ fn otlp_options(
 }
 
 #[rustler::nif]
-fn connect(
+fn connect<'a>(
     runtime: ResourceArc<RuntimeResource>,
     target: String,
     api_key: Option<String>,
     headers: HashMap<String, String>,
+    tls: Term<'a>,
     pid: LocalPid,
 ) -> Atom {
     let handle = runtime.core.tokio_handle();
@@ -555,15 +571,19 @@ fn connect(
     } else {
         Some(headers)
     };
+    // Decoded here, while the terms are still alive; errors surface through the
+    // connect result like any other connection failure.
+    let tls = tls_options_from_term(tls);
 
     handle.clone().spawn(async move {
         let guard = TaskGuard::new(pid, GuardFailure::Connect);
         let result = async {
-            let url = parse_target_url(&target)?;
-            let tls = if url.scheme() == "https" {
-                Some(TlsOptions::default())
-            } else {
-                None
+            let tls = tls?;
+            let url = target_url(&target, tls.is_some())?;
+            let tls = match tls {
+                Some(tls) => Some(tls),
+                None if url.scheme() == "https" => Some(TlsOptions::default()),
+                None => None,
             };
 
             let connection_options = ConnectionOptions::new(url)
@@ -647,10 +667,12 @@ fn versioning_strategy_from_opts(opts: Term) -> anyhow::Result<WorkerVersioningS
 
     // v0.7.0 made WorkerDeploymentOptions #[non_exhaustive] with a bon
     // builder, so it can no longer be built with a struct literal.
-    let builder = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-        deployment_name,
-        build_id,
-    })
+    let builder = WorkerDeploymentOptions::new(
+        WorkerDeploymentVersion::builder()
+            .deployment_name(deployment_name)
+            .build_id(build_id)
+            .build(),
+    )
     .use_worker_versioning(use_worker_versioning);
 
     let options = match default_versioning_behavior {
@@ -795,6 +817,123 @@ fn start_worker<'a>(
     ok().encode(env)
 }
 
+/// Start a replay worker: sdk-core's own replayer, fed recorded histories
+/// instead of a server. Its activations go through the same Elixir path as a
+/// live worker's (the poller bridge, the Server, the executors). Replay only
+/// runs workflows, so only the workflow poll loop is started. Sends
+/// `{:replay_worker_started, worker, feeder}` or `{:worker_error, reason}` to
+/// `pid`.
+#[rustler::nif]
+fn start_replay_worker(
+    runtime: ResourceArc<RuntimeResource>,
+    task_queue: String,
+    namespace: String,
+    pid: LocalPid,
+    poll_pid: LocalPid,
+) -> Atom {
+    let handle = runtime.core.tokio_handle();
+    let runtime_for_worker = runtime.clone();
+
+    handle.clone().spawn(async move {
+        let guard = TaskGuard::new(pid, GuardFailure::WorkerStart);
+        let result = async {
+            // Replay overrides the pollers, the cache size and the task types
+            // itself; these are the fields it leaves to us.
+            let config = WorkerConfig::builder()
+                .namespace(namespace)
+                .task_queue(task_queue)
+                .versioning_strategy(WorkerVersioningStrategy::None {
+                    build_id: "temporalex-replay".to_string(),
+                })
+                .task_types(WorkerTaskTypes::workflow_only())
+                .build()
+                .map_err(|err| anyhow!(err))?;
+
+            let (feeder, histories) = HistoryFeeder::new(1);
+            let worker = init_replay_worker(ReplayWorkerInput::new(config, histories))?;
+            worker.validate().await?;
+            Ok::<_, anyhow::Error>((worker, feeder))
+        }
+        .await;
+
+        match result {
+            Ok((worker, feeder)) => {
+                let worker = ResourceArc::new(WorkerResource {
+                    worker: Arc::new(worker),
+                    runtime_handle: handle.clone(),
+                    _runtime: runtime_for_worker,
+                });
+                let feeder = ResourceArc::new(ReplayFeederResource {
+                    feeder: std::sync::Mutex::new(Some(Arc::new(feeder))),
+                    runtime_handle: handle.clone(),
+                });
+
+                start_workflow_poll_loop(worker.clone(), poll_pid);
+                send_simple(&pid, |env| {
+                    (replay_worker_started(), worker, feeder).encode(env)
+                });
+            }
+            Err(err) => {
+                send_simple(&pid, |env| (worker_error(), format!("{err:#}")).encode(env));
+            }
+        }
+
+        guard.complete();
+    });
+
+    ok()
+}
+
+/// Queue one recorded history (raw `temporal.api.history.v1.History` bytes)
+/// for replay. Bad bytes are refused here: core panics on a history whose
+/// started event has no run id. Otherwise returns `:ok` and later sends
+/// `{:replay_pushed, :ok | {:error, reason}}` to `pid` once the replay worker
+/// has taken the history, so the caller feeds histories one at a time and in
+/// order.
+#[rustler::nif]
+fn replay_push<'a>(
+    env: Env<'a>,
+    feeder: ResourceArc<ReplayFeederResource>,
+    workflow_id: String,
+    bytes: Binary,
+    pid: LocalPid,
+) -> Term<'a> {
+    let history = match History::decode(bytes.as_slice()) {
+        Ok(history) => history,
+        Err(err) => return (error(), format!("undecodable history: {err}")).encode(env),
+    };
+    if let Err(err) = history.extract_run_id_from_start() {
+        return (
+            error(),
+            format!("history has no run id in its started event: {err:#}"),
+        )
+            .encode(env);
+    }
+    let Some(history_feeder) = feeder.feeder.lock().unwrap().clone() else {
+        return (error(), "replay already finished").encode(env);
+    };
+
+    feeder.runtime_handle.spawn(async move {
+        let result = history_feeder
+            .feed(HistoryForReplay::new(history, workflow_id))
+            .await;
+        send_simple(&pid, |env| match result {
+            Ok(()) => (replay_pushed(), ok()).encode(env),
+            Err(err) => (replay_pushed(), (error(), format!("{err:#}"))).encode(env),
+        });
+    });
+
+    ok().encode(env)
+}
+
+/// End the history stream. Once the last history has been replayed, the
+/// replay worker shuts down and the workflow poll loop exits with `:shutdown`.
+#[rustler::nif]
+fn replay_finish(feeder: ResourceArc<ReplayFeederResource>) -> Atom {
+    feeder.feeder.lock().unwrap().take();
+    ok()
+}
+
 #[rustler::nif]
 fn complete_workflow_activation(
     worker: ResourceArc<WorkerResource>,
@@ -919,6 +1058,19 @@ fn start_workflow<'a>(
             return ok();
         }
     };
+    let start_signal = match start_signal_from_opts(opts) {
+        Ok(s) => s,
+        Err(err) => {
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_started(),
+                error_reason(env, invalid_options(), format!("{err:#}")),
+            );
+            return ok();
+        }
+    };
     let connection = client.connection.clone();
     let handle = client._runtime_handle.clone();
     let saved_env = OwnedEnv::new();
@@ -929,10 +1081,25 @@ fn start_workflow<'a>(
             let client = Client::new(connection, ClientOptions::new(namespace.clone()).build())
                 .map_err(|err| StartWorkflowResult::Other(format!("{err:#}")))?;
             let workflow = UntypedWorkflow::new(workflow_type.clone());
-            let handle = client
-                .start_workflow(workflow, RawValue::new(vec![input_payload]), start_options)
-                .await
-                .map_err(StartWorkflowResult::Start)?;
+            let handle = match start_signal {
+                None => {
+                    client
+                        .start_workflow(workflow, RawValue::new(vec![input_payload]), start_options)
+                        .await
+                }
+                Some((signal_name, signal_payloads)) => {
+                    client
+                        .signal_with_start_workflow(
+                            workflow,
+                            RawValue::new(vec![input_payload]),
+                            UntypedSignal::<UntypedWorkflow>::new(signal_name),
+                            RawValue::new(signal_payloads),
+                            start_options,
+                        )
+                        .await
+                }
+            }
+            .map_err(StartWorkflowResult::Start)?;
             let run_id = handle.info().run_id.clone().unwrap_or_default();
             Ok::<_, StartWorkflowResult>((workflow_id, workflow_type, run_id))
         }
@@ -1359,10 +1526,12 @@ fn fetch_workflow_history(
         let result = async {
             let wf = untyped_handle(connection, namespace, workflow_id, run_id)
                 .map_err(WorkflowInteractionResult::Other)?;
-            let history = wf
+            let events = wf
                 .fetch_history(WorkflowFetchHistoryOptions::default())
+                .into_events()
                 .await
                 .map_err(WorkflowInteractionResult::Interaction)?;
+            let history = History { events };
             Ok::<_, WorkflowInteractionResult>(history)
         }
         .await;
@@ -1374,7 +1543,7 @@ fn fetch_workflow_history(
             workflow_history_fetched(),
             |env| match result {
                 Ok(history) => {
-                    let bytes = History::from(history).encode_to_vec();
+                    let bytes = history.encode_to_vec();
                     (ok(), binary_term(env, &bytes)).encode(env)
                 }
                 Err(err) => (error(), workflow_interaction_error_to_term(env, err)).encode(env),
@@ -1441,6 +1610,62 @@ fn parse_target_url(target: &str) -> anyhow::Result<Url> {
     }
 }
 
+// A bare "host:port" target means https when TLS options are given; an explicit
+// http:// target with TLS options is a contradiction and is refused.
+fn target_url(target: &str, tls: bool) -> anyhow::Result<Url> {
+    match (tls, target.contains("://")) {
+        (true, false) => Ok(Url::parse(&format!("https://{target}"))?),
+        (true, true) if target.starts_with("http://") => {
+            Err(anyhow!(":tls options need an https target, got {target:?}"))
+        }
+        _ => parse_target_url(target),
+    }
+}
+
+// `:tls` as sent by Temporalex.Backend.TemporalCore: nil for no explicit TLS,
+// or a keyword list of PEM binaries (:server_root_ca_cert, :client_cert,
+// :client_private_key) and the server name to verify (:domain).
+fn tls_options_from_term(tls: Term) -> anyhow::Result<Option<TlsOptions>> {
+    if tls.decode::<Atom>().ok() == Some(nil()) {
+        return Ok(None);
+    }
+
+    let client_tls_options = match (
+        keyword_get_bytes(tls, client_cert())?,
+        keyword_get_bytes(tls, client_private_key())?,
+    ) {
+        (Some(cert), Some(key)) => Some(
+            ClientTlsOptions::builder()
+                .client_cert(cert)
+                .client_private_key(key)
+                .build(),
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                ":tls needs :client_cert and :client_private_key together"
+            ));
+        }
+    };
+
+    Ok(Some(
+        TlsOptions::builder()
+            .maybe_server_root_ca_cert(keyword_get_bytes(tls, server_root_ca_cert())?)
+            .maybe_domain(keyword_get_string(tls, domain())?)
+            .maybe_client_tls_options(client_tls_options)
+            .build(),
+    ))
+}
+
+fn keyword_get_bytes(opts: Term, key: Atom) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(term) = keyword_get_present(opts, key)? else {
+        return Ok(None);
+    };
+
+    let binary: Binary = decode_term(term)?;
+    Ok(Some(binary.as_slice().to_vec()))
+}
+
 /// Attach the owner-death monitor from a real NIF context. Must be called
 /// by the process that owns the worker (the Temporalex.Server) once it has
 /// received the WorkerResource. When the caller dies — however violently —
@@ -1474,6 +1699,11 @@ fn schedule_worker_shutdown(worker: Arc<Worker>, handle: tokio::runtime::Handle)
 }
 
 fn start_poll_loops(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
+    start_workflow_poll_loop(worker.clone(), pid);
+    start_activity_poll_loop(worker, pid);
+}
+
+fn start_workflow_poll_loop(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
     let workflow_worker = worker.clone();
     let workflow_pid = pid;
     worker.runtime_handle.spawn(async move {
@@ -1498,7 +1728,9 @@ fn start_poll_loops(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
             }
         }
     });
+}
 
+fn start_activity_poll_loop(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
     let activity_worker = worker.clone();
     let activity_pid = pid;
     worker.runtime_handle.spawn(async move {
@@ -1585,12 +1817,12 @@ fn untyped_handle(
     let client = Client::new(connection, ClientOptions::new(namespace.clone()).build())?;
     Ok(WorkflowHandle::<Client, UntypedWorkflow>::new(
         client,
-        WorkflowExecutionInfo {
-            namespace,
-            workflow_id,
-            run_id: run_id.clone(),
-            first_execution_run_id: run_id,
-        },
+        WorkflowExecutionInfo::builder()
+            .namespace(namespace)
+            .workflow_id(workflow_id)
+            .maybe_run_id(run_id.clone())
+            .maybe_first_execution_run_id(run_id)
+            .build(),
     ))
 }
 
@@ -2271,8 +2503,7 @@ fn workflow_start_options(
     opts: Term,
 ) -> anyhow::Result<WorkflowStartOptions> {
     let mut options = WorkflowStartOptions::new(task_queue, workflow_id).build();
-    options.id_reuse_policy = workflow_id_reuse_policy_from_opts(opts)?;
-    options.id_conflict_policy = workflow_id_conflict_policy_from_opts(opts)?;
+    (options.id_reuse_policy, options.id_conflict_policy) = workflow_id_policies_from_opts(opts)?;
     options.execution_timeout =
         duration_option_from_opts(opts, &[execution_timeout(), workflow_execution_timeout()])?;
     options.run_timeout =
@@ -2290,7 +2521,6 @@ fn workflow_start_options(
     // The client wraps the proto retry policy in its own type now; From is
     // the whole conversion, so our option decoding is unchanged.
     options.retry_policy = retry_policy_from_opts(opts)?.map(Into::into);
-    options.start_signal = start_signal_from_opts(opts)?;
     options.priority = priority_from_opts(opts)?;
     options.header = header_from_opts(opts)?;
     options.static_summary = keyword_get_string(opts, static_summary())?;
@@ -2298,7 +2528,7 @@ fn workflow_start_options(
     Ok(options)
 }
 
-fn start_signal_from_opts(opts: Term) -> anyhow::Result<Option<WorkflowStartSignal>> {
+fn start_signal_from_opts(opts: Term) -> anyhow::Result<Option<(String, Vec<Payload>)>> {
     let Some(term) = keyword_get_present(opts, start_signal())? else {
         return Ok(None);
     };
@@ -2307,15 +2537,12 @@ fn start_signal_from_opts(opts: Term) -> anyhow::Result<Option<WorkflowStartSign
         return Err(anyhow!("start_signal requires a name"));
     };
 
-    let mut signal = WorkflowStartSignal::new(signal_name).build();
-    signal.input = match keyword_get_present(term, args())? {
-        None => None,
-        Some(args) => Some(Payloads {
-            payloads: terms_list_to_payloads(args)?,
-        }),
+    let payloads = match keyword_get_present(term, args())? {
+        None => vec![],
+        Some(args) => terms_list_to_payloads(args)?,
     };
 
-    Ok(Some(signal))
+    Ok(Some((signal_name, payloads)))
 }
 
 fn signal_options(opts: Term) -> anyhow::Result<WorkflowSignalOptions> {
@@ -2463,25 +2690,58 @@ fn retry_policy_from_term(term: Term) -> anyhow::Result<RetryPolicy> {
     })
 }
 
-#[allow(deprecated)]
-fn workflow_id_reuse_policy_from_opts(opts: Term) -> anyhow::Result<WorkflowIdReusePolicy> {
+// The client API dropped the deprecated reuse policy TerminateIfRunning. Its
+// server-side equivalent is conflict policy TerminateExisting with reuse policy
+// AllowDuplicate, so `:terminate_if_running` keeps working as that pair.
+enum IdReusePolicy {
+    Policy(WorkflowIdReusePolicy),
+    TerminateIfRunning,
+}
+
+fn workflow_id_policies_from_opts(
+    opts: Term,
+) -> anyhow::Result<(WorkflowIdReusePolicy, WorkflowIdConflictPolicy)> {
+    let conflict = workflow_id_conflict_policy_from_opts(opts)?;
+
+    match workflow_id_reuse_policy_from_opts(opts)? {
+        IdReusePolicy::Policy(reuse) => Ok((reuse, conflict)),
+        IdReusePolicy::TerminateIfRunning => match conflict {
+            WorkflowIdConflictPolicy::Unspecified | WorkflowIdConflictPolicy::TerminateExisting => {
+                Ok((
+                    WorkflowIdReusePolicy::AllowDuplicate,
+                    WorkflowIdConflictPolicy::TerminateExisting,
+                ))
+            }
+            _ => Err(anyhow!(
+                "id_reuse_policy :terminate_if_running terminates the running workflow, \
+                 which contradicts the given id_conflict_policy"
+            )),
+        },
+    }
+}
+
+fn workflow_id_reuse_policy_from_opts(opts: Term) -> anyhow::Result<IdReusePolicy> {
     let Some(term) =
         keyword_get(opts, workflow_id_reuse_policy())?.or(keyword_get(opts, id_reuse_policy())?)
     else {
-        return Ok(WorkflowIdReusePolicy::Unspecified);
+        return Ok(IdReusePolicy::Policy(WorkflowIdReusePolicy::Unspecified));
     };
 
     let atom: Atom = decode_term(term)?;
     if atom == allow_duplicate() {
-        Ok(WorkflowIdReusePolicy::AllowDuplicate)
+        Ok(IdReusePolicy::Policy(WorkflowIdReusePolicy::AllowDuplicate))
     } else if atom == allow_duplicate_failed_only() {
-        Ok(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)
+        Ok(IdReusePolicy::Policy(
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+        ))
     } else if atom == reject_duplicate() {
-        Ok(WorkflowIdReusePolicy::RejectDuplicate)
+        Ok(IdReusePolicy::Policy(
+            WorkflowIdReusePolicy::RejectDuplicate,
+        ))
     } else if atom == terminate_if_running() {
-        Ok(WorkflowIdReusePolicy::TerminateIfRunning)
+        Ok(IdReusePolicy::TerminateIfRunning)
     } else if atom == unspecified() {
-        Ok(WorkflowIdReusePolicy::Unspecified)
+        Ok(IdReusePolicy::Policy(WorkflowIdReusePolicy::Unspecified))
     } else {
         Err(anyhow!("unsupported workflow id reuse policy"))
     }
@@ -2584,6 +2844,7 @@ fn on_load(env: Env, _load_info: Term) -> bool {
     env.register::<RuntimeResource>().is_ok()
         && env.register::<ClientResource>().is_ok()
         && env.register::<WorkerResource>().is_ok()
+        && env.register::<ReplayFeederResource>().is_ok()
 }
 
 rustler::init!("Elixir.Temporalex.Native", load = on_load);

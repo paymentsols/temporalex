@@ -39,7 +39,8 @@ defmodule Temporalex.Server do
               executor_refs: %{},
               pending_activations: %{},
               activity_tasks_by_ref: %{},
-              activity_refs_by_token: %{}
+              activity_refs_by_token: %{},
+              replay?: false
   end
 
   def start_link(opts) do
@@ -63,6 +64,35 @@ defmodule Temporalex.Server do
 
   @impl GenServer
   def init(opts) do
+    if Keyword.get(opts, :replay, false), do: init_replay(opts), else: init_live(opts)
+  end
+
+  # A replay server (Temporalex.Replay) drives sdk-core's replayer: no client,
+  # no activities, and the end of the history stream is a normal stop. From
+  # here on every activation takes the same path as a live worker's.
+  defp init_replay(opts) do
+    case Temporalex.Backend.TemporalCore.start_replay_worker(opts, self()) do
+      {:ok, backend_state} ->
+        {:ok,
+         %State{
+           name: Keyword.fetch!(opts, :name),
+           backend: Temporalex.Backend.TemporalCore,
+           backend_state: backend_state,
+           namespace: backend_state.namespace,
+           task_queue: backend_state.task_queue,
+           workflow_safe_mode: Keyword.get(opts, :workflow_safe_mode, :off),
+           workflow_map: workflow_map(Keyword.get(opts, :workflows, [])),
+           executor_supervisor: Keyword.fetch!(opts, :executor_supervisor),
+           activity_supervisor: Keyword.fetch!(opts, :activity_supervisor),
+           replay?: true
+         }}
+
+      {:error, reason} ->
+        {:stop, {:backend_start_failed, reason}}
+    end
+  end
+
+  defp init_live(opts) do
     client = Keyword.fetch!(opts, :client)
 
     with {:ok, connection} <- Temporalex.Client.connection(client),
@@ -150,6 +180,10 @@ defmodule Temporalex.Server do
 
   def handle_info({:activity_completion, {:error, reason}}, state) do
     {:stop, {:backend_activity_completion_failed, reason}, state}
+  end
+
+  def handle_info({:poll_loop_exited, :workflow, :shutdown}, %State{replay?: true} = state) do
+    {:stop, :normal, state}
   end
 
   def handle_info({:poll_loop_exited, kind, :shutdown}, state)

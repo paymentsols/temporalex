@@ -48,13 +48,179 @@ defmodule Temporalex.Replay do
         {:ok, history} = Temporalex.Replay.decode(File.read!(fixture))
         assert :ok = Temporalex.Replay.replay(history, workflows: [Checkout])
       end
+
+  ## Replaying through core
+
+  `replay_histories/2` replays the same raw fixtures through sdk-core's own
+  replayer instead, driving the production executor exactly as a live worker
+  does. Core's state machines then do the matching, so every history core can
+  run is covered, including patch markers, child workflows, updates,
+  continue-as-new and local activities:
+
+      histories = for f <- Path.wildcard("test/fixtures/histories/*.binpb"), do: File.read!(f)
+      {:ok, results} = Temporalex.Replay.replay_histories(histories, workflows: [Checkout])
+      assert Enum.all?(results, &(&1.result == :ok))
   """
 
+  alias Temporalex.Backend.TemporalCore
   alias Temporalex.Backend.TemporalCore.Codec
   alias Temporalex.Backend.TemporalCore.PayloadConverter
   alias Temporalex.History
   alias Temporalex.History.Event
   alias Temporalex.Testing.Runner
+
+  @server_opts [
+    :namespace,
+    :task_queue,
+    :payload_codec,
+    :workflow_safe_mode,
+    :start_timeout,
+    :shutdown_timeout
+  ]
+
+  @doc """
+  Replays raw history fixtures through sdk-core's replayer and the production
+  executor.
+
+  `histories` is a list of raw history bytes, the `raw: true` fetch shape, or
+  `{workflow_id, bytes}` pairs; recorded history does not carry the workflow
+  id, so without one each history gets `"replay-<n>"`. `workflows:` lists the
+  modules that may run them, resolved by recorded workflow type.
+
+  Returns `{:ok, results}` with one map per history, in the order given:
+  `%{workflow_id: id, run_id: run_id, result: result}`, where `result` is
+
+    * `:ok`: the current code makes the recorded decisions;
+    * `{:error, {:nondeterminism, message}}`: it diverges from the record;
+    * `{:error, {:workflow_task_failed, message}}`: the workflow task failed
+      for another reason, such as an unknown workflow type or a crash;
+    * `{:error, {reason, message}}` for any other eviction reason core gives.
+
+  Each history ends in exactly one eviction, and its reason is the outcome, as
+  in the official Rust SDK's replayer. `{:error, reason}` means the replay
+  itself could not run.
+
+  Options: `:workflows` (required), `:timeout` (whole replay, default 30
+  seconds per history), `:payload_codec`, `:workflow_safe_mode`,
+  `:namespace`, `:task_queue`.
+  """
+  @spec replay_histories([binary() | {String.t(), binary()}], keyword()) ::
+          {:ok, [%{workflow_id: String.t(), run_id: String.t() | nil, result: term()}]}
+          | {:error, term()}
+  def replay_histories(histories, opts) when is_list(histories) and is_list(opts) do
+    workflows = Keyword.fetch!(opts, :workflows)
+    timeout = Keyword.get(opts, :timeout, 30_000 * max(length(histories), 1))
+    inputs = histories |> Enum.with_index(1) |> Enum.map(&history_input/1)
+    name = :"temporalex_replay_#{System.unique_integer([:positive])}"
+    handler = {__MODULE__, name}
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:temporalex, :workflow, :evicted],
+        &__MODULE__.handle_eviction/4,
+        %{worker: name, pid: self()}
+      )
+
+    {:ok, executors} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    {:ok, activities} = Task.Supervisor.start_link()
+
+    server_opts =
+      [
+        replay: true,
+        name: name,
+        workflows: workflows,
+        executor_supervisor: executors,
+        activity_supervisor: activities
+      ] ++ Keyword.take(opts, @server_opts)
+
+    try do
+      with {:ok, server} <- GenServer.start(Temporalex.Server, server_opts) do
+        ref = Process.monitor(server)
+        backend_state = Temporalex.Server.backend_state(server)
+        pushed = push_histories(backend_state, inputs)
+        TemporalCore.replay_finish(backend_state)
+        # Wait for the server either way, so a push failure never returns while
+        # it is still replaying what was already pushed.
+        replayed = await_replay(server, ref, timeout)
+        evictions = collect_evictions(name)
+
+        with :ok <- pushed, :ok <- replayed do
+          {:ok, outcomes(inputs, evictions)}
+        end
+      end
+    after
+      :telemetry.detach(handler)
+      DynamicSupervisor.stop(executors)
+      Supervisor.stop(activities)
+    end
+  end
+
+  @doc false
+  def handle_eviction(_event, _measurements, %{worker: worker} = meta, %{worker: worker} = config) do
+    send(config.pid, {:temporalex_replay_evicted, worker, meta.reason, meta.message, meta.run_id})
+  end
+
+  def handle_eviction(_event, _measurements, _meta, _config), do: :ok
+
+  defp history_input({{workflow_id, bytes}, _n}) when is_binary(workflow_id) and is_binary(bytes),
+    do: {workflow_id, bytes}
+
+  defp history_input({bytes, n}) when is_binary(bytes), do: {"replay-#{n}", bytes}
+
+  defp push_histories(backend_state, inputs) do
+    inputs
+    |> Enum.with_index(1)
+    |> Enum.reduce_while(:ok, fn {{workflow_id, bytes}, n}, :ok ->
+      case TemporalCore.replay_push(backend_state, workflow_id, bytes) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:replay_push_failed, n, reason}}}
+      end
+    end)
+  end
+
+  defp await_replay(server, ref, timeout) do
+    receive do
+      {:DOWN, ^ref, :process, ^server, :normal} -> :ok
+      {:DOWN, ^ref, :process, ^server, reason} -> {:error, {:replay_worker_down, reason}}
+    after
+      timeout ->
+        Process.demonitor(ref, [:flush])
+        Process.exit(server, :kill)
+        {:error, {:replay_timeout, timeout}}
+    end
+  end
+
+  # The Server has stopped, so every eviction it reported is in the mailbox.
+  defp collect_evictions(name, acc \\ []) do
+    receive do
+      {:temporalex_replay_evicted, ^name, reason, message, run_id} ->
+        collect_evictions(name, [{reason, message, run_id} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp outcomes([], _evictions), do: []
+
+  defp outcomes([{workflow_id, _bytes} | inputs], [{reason, message, run_id} | evictions]) do
+    [
+      %{workflow_id: workflow_id, run_id: run_id, result: outcome(reason, message)}
+      | outcomes(inputs, evictions)
+    ]
+  end
+
+  defp outcomes([{workflow_id, _bytes} | inputs], []) do
+    [
+      %{workflow_id: workflow_id, run_id: nil, result: {:error, :no_outcome}}
+      | outcomes(inputs, [])
+    ]
+  end
+
+  defp outcome(reason, _message) when reason in [:lang_requested, :cache_full], do: :ok
+  defp outcome(:nondeterminism, message), do: {:error, {:nondeterminism, message}}
+  defp outcome(:lang_fail, message), do: {:error, {:workflow_task_failed, message}}
+  defp outcome(reason, message), do: {:error, {reason, message}}
 
   @doc """
   Decodes a raw history fixture (the `raw: true` fetch shape) into a
