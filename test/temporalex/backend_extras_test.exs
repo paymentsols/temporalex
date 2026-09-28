@@ -11,6 +11,48 @@ defmodule Temporalex.BackendExtrasTest do
   alias Temporalex.Core.ActivityCompletion
   alias Temporalex.Core.Command
   alias Temporalex.Core.Completion
+  alias Temporalex.Core.Nondeterminism
+
+  @completion :"coresdk.workflow_completion.WorkflowActivationCompletion"
+
+  describe "workflow task failure cause" do
+    test "a nondeterminism failure reaches core as NON_DETERMINISTIC_ERROR" do
+      # The executor's failed completion for a replay divergence, as it builds it.
+      completion = %Completion{
+        run_id: "run-nondeterministic",
+        status:
+          {:failed, Nondeterminism.exception(message: "replay command mismatch"),
+           force_cause: :non_deterministic_error}
+      }
+
+      assert {:ok, bytes} = Codec.workflow_completion_to_bytes(completion, task_queue: "q")
+
+      assert {:ok, %{status: {:failed, failed}}} =
+               Temporalex.Backend.TemporalCore.Proto.Schema.decode(bytes, @completion)
+
+      # proto3 omits a field at its default, UNSPECIFIED
+      cause = Map.get(failed, :force_cause, :WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED)
+
+      assert cause == :WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR
+    end
+
+    test "other failures reach core as UNSPECIFIED" do
+      completion = %Completion{
+        run_id: "run-failed",
+        status: {:failed, RuntimeError.exception("boom"), force_cause: :workflow_task_failed}
+      }
+
+      assert {:ok, bytes} = Codec.workflow_completion_to_bytes(completion, task_queue: "q")
+
+      assert {:ok, %{status: {:failed, failed}}} =
+               Temporalex.Backend.TemporalCore.Proto.Schema.decode(bytes, @completion)
+
+      # proto3 omits a field at its default, UNSPECIFIED
+      cause = Map.get(failed, :force_cause, :WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED)
+
+      assert cause == :WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED
+    end
+  end
 
   describe "ScheduleLocalActivity codec" do
     test "encodes a local activity schedule with valid options" do

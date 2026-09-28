@@ -1350,10 +1350,16 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
     end
   end
 
+  # The executor marks a replay divergence :non_deterministic_error (after the
+  # proto's name); core then evicts the run with reason NONDETERMINISM instead
+  # of treating it as an ordinary workflow task failure.
   defp force_cause_from_opts(opts) do
     case Keyword.get(opts, :force_cause) do
-      :nondeterminism -> :WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR
-      _ -> :WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED
+      cause when cause in [:non_deterministic_error, :nondeterminism] ->
+        :WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR
+
+      _ ->
+        :WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED
     end
   end
 
