@@ -169,6 +169,20 @@ application:
 {:mint, "~> 1.7"}           # grpc's pure-Elixir HTTP/2 client; gun is not needed
 ```
 
+An application that runs no workers and whose clients all use the gRPC
+backend can compile Temporalex **without the NIF**, so it needs no Rust
+toolchain and downloads no precompiled library:
+
+```elixir
+# config/config.exs
+config :temporalex, nif: false
+```
+
+It is a compile-time setting (recompile Temporalex after changing it:
+`mix deps.compile temporalex --force`). With it, `Temporalex.Backend.TemporalCore`
+refuses to start a client, replay or worker with an error naming the setting,
+and `rustler` can be left out of the application's dependencies.
+
 Notes:
 
 - `grpc` pulls in `googleapis`, which declares `elixir: "~> 1.18"`. The backend
