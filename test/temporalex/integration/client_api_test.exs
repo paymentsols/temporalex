@@ -12,6 +12,7 @@ defmodule Temporalex.ClientApiIntegrationTest do
 
   @moduletag :external
 
+  alias Temporalex.TestSupport.Backends
   alias Temporalex.TestSupport.Server
 
   defmodule Workflow do
@@ -59,13 +60,10 @@ defmodule Temporalex.ClientApiIntegrationTest do
     end
 
     worker_name = Module.concat(__MODULE__, :"Worker#{System.unique_integer([:positive])}")
-    client_name = Module.concat(__MODULE__, :"Client#{System.unique_integer([:positive])}")
     task_queue = "client-api-#{System.unique_integer([:positive])}"
 
-    {:ok, client_pid} =
-      Temporalex.Client.start_link(
-        name: client_name,
-        backend: Temporalex.Backend.TemporalCore,
+    clients =
+      Backends.start_clients(__MODULE__,
         target: Server.target(),
         namespace: Temporalex.TestSupport.Namespace.name(),
         task_queue: task_queue
@@ -74,7 +72,7 @@ defmodule Temporalex.ClientApiIntegrationTest do
     {:ok, worker_pid} =
       Temporalex.Worker.start_link(
         name: worker_name,
-        client: client_name,
+        client: clients.nif,
         task_queue: task_queue,
         workflows: [Workflow, LongRunner],
         activities: []
@@ -83,153 +81,162 @@ defmodule Temporalex.ClientApiIntegrationTest do
     on_exit(fn ->
       try do
         if Process.alive?(worker_pid), do: Supervisor.stop(worker_pid, :normal, 5_000)
-        if Process.alive?(client_pid), do: GenServer.stop(client_pid, :normal, 5_000)
       catch
         :exit, _ -> :ok
       end
     end)
 
-    {:ok, client: client_name, worker: worker_name}
+    {:ok, clients: clients, worker: worker_name}
   end
 
-  test "start_workflow returns a handle with workflow_id and run_id", %{client: client} do
-    workflow_id = "client-start-#{System.unique_integer([:positive])}"
+  # Every test below runs once per client backend (see
+  # Temporalex.TestSupport.Backends); the worker always runs on the NIF.
+  setup %{clients: clients, backend: backend}, do: {:ok, client: clients[backend]}
 
-    assert {:ok, handle} =
-             Temporalex.Client.start_workflow(client, Workflow, 0,
-               workflow_id: workflow_id,
-               timeout: 10_000
-             )
+  for backend <- Backends.all() do
+    describe "#{backend} backend" do
+      @describetag backend: backend
 
-    assert handle.workflow_id == workflow_id
-    assert is_binary(handle.run_id) and handle.run_id != ""
-    assert handle.workflow_type == Workflow.__workflow_type__()
+      test "start_workflow returns a handle with workflow_id and run_id", %{client: client} do
+        workflow_id = "client-start-#{System.unique_integer([:positive])}"
 
-    # Cleanup so the workflow doesn't linger forever.
-    _ = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
-    _ = Temporalex.Client.get_result(handle, timeout: 10_000)
-  end
+        assert {:ok, handle} =
+                 Temporalex.Client.start_workflow(client, Workflow, 0,
+                   workflow_id: workflow_id,
+                   timeout: 10_000
+                 )
 
-  test "signal_workflow delivers the signal to the workflow", %{client: client} do
-    {:ok, handle} =
-      Temporalex.Client.start_workflow(client, Workflow, 0,
-        workflow_id: "client-signal-#{System.unique_integer([:positive])}",
-        timeout: 10_000
-      )
+        assert handle.workflow_id == workflow_id
+        assert is_binary(handle.run_id) and handle.run_id != ""
+        assert handle.workflow_type == Workflow.__workflow_type__()
 
-    assert :ok = Temporalex.Client.signal_workflow(handle, "tick", [], timeout: 5_000)
-    assert :ok = Temporalex.Client.signal_workflow(handle, "tick", [], timeout: 5_000)
-    assert :ok = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
+        # Cleanup so the workflow doesn't linger forever.
+        _ = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
+        _ = Temporalex.Client.get_result(handle, timeout: 10_000)
+      end
 
-    assert {:ok, 2} = Temporalex.Client.get_result(handle, timeout: 15_000)
-  end
+      test "signal_workflow delivers the signal to the workflow", %{client: client} do
+        {:ok, handle} =
+          Temporalex.Client.start_workflow(client, Workflow, 0,
+            workflow_id: "client-signal-#{System.unique_integer([:positive])}",
+            timeout: 10_000
+          )
 
-  test "query_workflow returns the last published state", %{client: client} do
-    {:ok, handle} =
-      Temporalex.Client.start_workflow(client, Workflow, 7,
-        workflow_id: "client-query-#{System.unique_integer([:positive])}",
-        timeout: 10_000
-      )
+        assert :ok = Temporalex.Client.signal_workflow(handle, "tick", [], timeout: 5_000)
+        assert :ok = Temporalex.Client.signal_workflow(handle, "tick", [], timeout: 5_000)
+        assert :ok = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
 
-    # Eventually the workflow publishes 7 as its state.
-    assert eventually(fn ->
-             Temporalex.Client.query_workflow(handle, "counter", [], timeout: 5_000) ==
-               {:ok, 7}
-           end)
+        assert {:ok, 2} = Temporalex.Client.get_result(handle, timeout: 15_000)
+      end
 
-    _ = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
-    _ = Temporalex.Client.get_result(handle, timeout: 10_000)
-  end
+      test "query_workflow returns the last published state", %{client: client} do
+        {:ok, handle} =
+          Temporalex.Client.start_workflow(client, Workflow, 7,
+            workflow_id: "client-query-#{System.unique_integer([:positive])}",
+            timeout: 10_000
+          )
 
-  test "update_workflow returns the handler's reply", %{client: client} do
-    {:ok, handle} =
-      Temporalex.Client.start_workflow(client, Workflow, 10,
-        workflow_id: "client-update-#{System.unique_integer([:positive])}",
-        timeout: 10_000
-      )
+        # Eventually the workflow publishes 7 as its state.
+        assert eventually(fn ->
+                 Temporalex.Client.query_workflow(handle, "counter", [], timeout: 5_000) ==
+                   {:ok, 7}
+               end)
 
-    # Send a signal first and wait for the workflow to actually process it
-    # (signal_workflow returns when the server accepts the signal, not when
-    # the workflow has consumed it). Retry the update itself in case the
-    # workflow task is still in flight when the first attempt arrives.
-    assert :ok = Temporalex.Client.signal_workflow(handle, "tick", [], timeout: 5_000)
+        _ = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
+        _ = Temporalex.Client.get_result(handle, timeout: 10_000)
+      end
 
-    assert eventually(fn ->
-             Temporalex.Client.query_workflow(handle, "counter", [], timeout: 2_000) ==
-               {:ok, 11}
-           end),
-           "workflow never processed the tick signal"
+      test "update_workflow returns the handler's reply", %{client: client} do
+        {:ok, handle} =
+          Temporalex.Client.start_workflow(client, Workflow, 10,
+            workflow_id: "client-update-#{System.unique_integer([:positive])}",
+            timeout: 10_000
+          )
 
-    # Retry on transient "not_accepting_update" — happens if the update
-    # arrives in a tiny window between activations where state.phase isn't
-    # populated in the cached executor's view.
-    assert eventually(fn ->
-             match?(
-               {:ok, 16},
-               Temporalex.Client.update_workflow(handle, "bump", [5], timeout: 5_000)
-             )
-           end),
-           "update never accepted"
+        # Send a signal first and wait for the workflow to actually process it
+        # (signal_workflow returns when the server accepts the signal, not when
+        # the workflow has consumed it). Retry the update itself in case the
+        # workflow task is still in flight when the first attempt arrives.
+        assert :ok = Temporalex.Client.signal_workflow(handle, "tick", [], timeout: 5_000)
 
-    assert {:ok, 18} = Temporalex.Client.update_workflow(handle, "bump", [2], timeout: 10_000)
+        assert eventually(fn ->
+                 Temporalex.Client.query_workflow(handle, "counter", [], timeout: 2_000) ==
+                   {:ok, 11}
+               end),
+               "workflow never processed the tick signal"
 
-    _ = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
-    assert {:ok, 18} = Temporalex.Client.get_result(handle, timeout: 10_000)
-  end
+        # Retry on transient "not_accepting_update" — happens if the update
+        # arrives in a tiny window between activations where state.phase isn't
+        # populated in the cached executor's view.
+        assert eventually(fn ->
+                 match?(
+                   {:ok, 16},
+                   Temporalex.Client.update_workflow(handle, "bump", [5], timeout: 5_000)
+                 )
+               end),
+               "update never accepted"
 
-  test "describe_workflow returns workflow execution info", %{client: client} do
-    workflow_id = "client-describe-#{System.unique_integer([:positive])}"
+        assert {:ok, 18} = Temporalex.Client.update_workflow(handle, "bump", [2], timeout: 10_000)
 
-    {:ok, handle} =
-      Temporalex.Client.start_workflow(client, Workflow, 0,
-        workflow_id: workflow_id,
-        timeout: 10_000
-      )
+        _ = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
+        assert {:ok, 18} = Temporalex.Client.get_result(handle, timeout: 10_000)
+      end
 
-    assert {:ok, description} =
-             Temporalex.Client.describe_workflow(handle, timeout: 5_000)
+      test "describe_workflow returns workflow execution info", %{client: client} do
+        workflow_id = "client-describe-#{System.unique_integer([:positive])}"
 
-    assert description.workflow_id == workflow_id
-    assert description.workflow_type == Workflow.__workflow_type__()
-    assert description.status == :running
-    assert is_integer(description.history_length)
-    assert description.history_length > 0
+        {:ok, handle} =
+          Temporalex.Client.start_workflow(client, Workflow, 0,
+            workflow_id: workflow_id,
+            timeout: 10_000
+          )
 
-    _ = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
-    _ = Temporalex.Client.get_result(handle, timeout: 10_000)
-  end
+        assert {:ok, description} =
+                 Temporalex.Client.describe_workflow(handle, timeout: 5_000)
 
-  test "cancel_workflow requests workflow cancellation", %{client: client} do
-    {:ok, handle} =
-      Temporalex.Client.start_workflow(client, LongRunner, nil,
-        workflow_id: "client-cancel-#{System.unique_integer([:positive])}",
-        timeout: 10_000
-      )
+        assert description.workflow_id == workflow_id
+        assert description.workflow_type == Workflow.__workflow_type__()
+        assert description.status == :running
+        assert is_integer(description.history_length)
+        assert description.history_length > 0
 
-    assert :ok = Temporalex.Client.cancel_workflow(handle, timeout: 5_000)
+        _ = Temporalex.Client.signal_workflow(handle, "stop", [], timeout: 5_000)
+        _ = Temporalex.Client.get_result(handle, timeout: 10_000)
+      end
 
-    # LongRunner doesn't actually check cancellation, so the cancel request
-    # is recorded but won't end the workflow until the sleep ends. Just
-    # verify cancel_workflow itself succeeded — that's the unit under test.
-    # Don't wait for the workflow to finish; the on_exit handles teardown.
-  end
+      test "cancel_workflow requests workflow cancellation", %{client: client} do
+        {:ok, handle} =
+          Temporalex.Client.start_workflow(client, LongRunner, nil,
+            workflow_id: "client-cancel-#{System.unique_integer([:positive])}",
+            timeout: 10_000
+          )
 
-  test "terminate_workflow forcibly ends the workflow", %{client: client} do
-    {:ok, handle} =
-      Temporalex.Client.start_workflow(client, LongRunner, nil,
-        workflow_id: "client-terminate-#{System.unique_integer([:positive])}",
-        timeout: 10_000
-      )
+        assert :ok = Temporalex.Client.cancel_workflow(handle, timeout: 5_000)
 
-    assert :ok =
-             Temporalex.Client.terminate_workflow(handle,
-               reason: "client_api_test",
-               details: :test_termination,
-               timeout: 5_000
-             )
+        # LongRunner doesn't actually check cancellation, so the cancel request
+        # is recorded but won't end the workflow until the sleep ends. Just
+        # verify cancel_workflow itself succeeded — that's the unit under test.
+        # Don't wait for the workflow to finish; the on_exit handles teardown.
+      end
 
-    assert {:error, %Temporalex.WorkflowTerminatedError{details: [:test_termination]}} =
-             Temporalex.Client.get_result(handle, timeout: 10_000)
+      test "terminate_workflow forcibly ends the workflow", %{client: client} do
+        {:ok, handle} =
+          Temporalex.Client.start_workflow(client, LongRunner, nil,
+            workflow_id: "client-terminate-#{System.unique_integer([:positive])}",
+            timeout: 10_000
+          )
+
+        assert :ok =
+                 Temporalex.Client.terminate_workflow(handle,
+                   reason: "client_api_test",
+                   details: :test_termination,
+                   timeout: 5_000
+                 )
+
+        assert {:error, %Temporalex.WorkflowTerminatedError{details: [:test_termination]}} =
+                 Temporalex.Client.get_result(handle, timeout: 10_000)
+      end
+    end
   end
 
   defp temporal_available? do

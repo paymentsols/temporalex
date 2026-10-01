@@ -15,6 +15,7 @@ defmodule Temporalex.SignalWithStartIntegrationTest do
 
   @moduletag :external
 
+  alias Temporalex.TestSupport.Backends
   alias Temporalex.TestSupport.Server
 
   @queue "signal-with-start"
@@ -56,12 +57,9 @@ defmodule Temporalex.SignalWithStartIntegrationTest do
     end
 
     worker_name = Module.concat(__MODULE__, :"Worker#{System.unique_integer([:positive])}")
-    client_name = Module.concat(__MODULE__, :"Client#{System.unique_integer([:positive])}")
 
-    {:ok, client_pid} =
-      Temporalex.Client.start_link(
-        name: client_name,
-        backend: Temporalex.Backend.TemporalCore,
+    clients =
+      Backends.start_clients(__MODULE__,
         target: Server.target(),
         namespace: Temporalex.TestSupport.Namespace.name(),
         task_queue: @queue
@@ -70,7 +68,7 @@ defmodule Temporalex.SignalWithStartIntegrationTest do
     {:ok, worker_pid} =
       Temporalex.Worker.start_link(
         name: worker_name,
-        client: client_name,
+        client: clients.nif,
         workflows: [Settlement],
         activities: []
       )
@@ -78,13 +76,12 @@ defmodule Temporalex.SignalWithStartIntegrationTest do
     on_exit(fn ->
       try do
         if Process.alive?(worker_pid), do: Supervisor.stop(worker_pid, :normal, 5_000)
-        if Process.alive?(client_pid), do: GenServer.stop(client_pid, :normal, 5_000)
       catch
         :exit, _ -> :ok
       end
     end)
 
-    {:ok, client: client_name, search_attribute: register_search_attribute!()}
+    {:ok, clients: clients, search_attribute: register_search_attribute!()}
   end
 
   # The shared per-run namespace registers no custom attributes, and this is
@@ -149,275 +146,6 @@ defmodule Temporalex.SignalWithStartIntegrationTest do
 
   defp order_id, do: "o#{System.unique_integer([:positive])}"
 
-  test "a settlement that arrives before the checkout starts it", ctx do
-    id = order_id()
-
-    handle =
-      id
-      |> checkout(2, ctx)
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start!()
-
-    assert handle.workflow_id == "order-#{id}"
-
-    :ok = Settlement.signal!(%{order_id: id}, "settled", settlement("pay-2"), client: ctx.client)
-
-    assert {:ok, {:settled, ["pay-1", "pay-2"], _}} = Temporalex.await(handle)
-  end
-
-  test "the settlement lands even though it precedes the phase that handles it", ctx do
-    id = order_id()
-
-    handle =
-      id
-      |> checkout(1, ctx)
-      |> Temporalex.with_signal("settled", [settlement("pay-only")])
-      |> Temporalex.start!()
-
-    assert {:ok, {:settled, ["pay-only"], _}} = Temporalex.await(handle)
-  end
-
-  test "a second settlement attaches to the running checkout rather than starting one", ctx do
-    id = order_id()
-
-    first =
-      id
-      |> checkout(2, ctx)
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start!()
-
-    second =
-      id
-      |> checkout(2, ctx)
-      |> Temporalex.with_signal("settled", [settlement("pay-2")])
-      |> Temporalex.start!()
-
-    assert second.run_id == first.run_id
-    assert {:ok, {:settled, ["pay-1", "pay-2"], _}} = Temporalex.await(first)
-  end
-
-  test "a start without with_signal is unchanged", ctx do
-    id = order_id()
-
-    handle = id |> checkout(1, ctx) |> Temporalex.start!()
-
-    :ok = Settlement.signal!(%{order_id: id}, "settled", settlement("pay-1"), client: ctx.client)
-
-    assert {:ok, {:settled, ["pay-1"], _}} = Temporalex.await(handle)
-  end
-
-  test "concurrent settlements racing the start all land exactly once", ctx do
-    id = order_id()
-    payments = for n <- 1..8, do: "pay-#{n}"
-
-    handles =
-      payments
-      |> Task.async_stream(
-        fn payment ->
-          id
-          |> checkout(length(payments), ctx)
-          |> Temporalex.with_signal("settled", [settlement(payment)])
-          |> Temporalex.start!()
-        end,
-        max_concurrency: 8,
-        timeout: 30_000
-      )
-      |> Enum.map(fn
-        {:ok, handle} -> handle
-        {:exit, reason} -> flunk("a racing start failed: #{inspect(reason)}")
-      end)
-
-    assert [_] = handles |> Enum.map(& &1.run_id) |> Enum.uniq()
-    assert {:ok, {:settled, settled, _}} = Temporalex.await(hd(handles))
-    assert settled == Enum.sort(payments)
-  end
-
-  test "a redelivered settlement does not start a second run or double-count", ctx do
-    id = order_id()
-
-    first =
-      id
-      |> checkout(2, ctx)
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start!()
-
-    redelivered =
-      id
-      |> checkout(2, ctx)
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start!()
-
-    assert redelivered.run_id == first.run_id
-
-    :ok = Settlement.signal!(%{order_id: id}, "settled", settlement("pay-2"), client: ctx.client)
-
-    assert {:ok, {:settled, ["pay-1", "pay-2"], _}} = Temporalex.await(first)
-  end
-
-  test "the phase timeout still fires when a settlement never arrives", ctx do
-    id = order_id()
-
-    handle =
-      id
-      |> checkout(2, ctx, %{phase_timeout: 2_000})
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start!()
-
-    assert {:ok, {:timed_out, ["pay-1"]}} = Temporalex.await(handle)
-  end
-
-  test "a rich settlement payload round-trips through the start request", ctx do
-    id = order_id()
-
-    payment =
-      settlement("pay-1", %{
-        "amount" => %{"units" => 1250, "currency" => "GBP"},
-        "transaction_id" => "txn-abc",
-        "refunded" => false,
-        "meta" => nil
-      })
-
-    handle =
-      id
-      |> checkout(1, ctx)
-      |> Temporalex.with_signal("settled", [payment])
-      |> Temporalex.start!()
-
-    assert {:ok, {:settled, ["pay-1"], received}} = Temporalex.await(handle)
-    assert received["pay-1"] == payment
-  end
-
-  test "with_signal/2 sends a signal carrying no arguments at all", ctx do
-    id = order_id()
-
-    handle =
-      id
-      |> checkout(1, ctx)
-      |> Temporalex.with_signal("abandoned")
-      |> Temporalex.start!()
-
-    assert {:ok, {:settled, ["abandoned"], _}} = Temporalex.await(handle)
-  end
-
-  test "retry survives the signal-with-start request", ctx do
-    id = order_id()
-
-    handle =
-      id
-      |> checkout(1, ctx)
-      |> Temporalex.retry(max_attempts: 3)
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start!()
-
-    assert {:ok, {:settled, ["pay-1"], _}} = Temporalex.await(handle)
-  end
-
-  test "priority is refused at the terminal verb, not silently dropped", ctx do
-    id = order_id()
-
-    assert_raise ArgumentError, ~r/cannot be combined with with_signal\/3/, fn ->
-      id
-      |> checkout(1, ctx)
-      |> Temporalex.priority(2)
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start()
-    end
-  end
-
-  # The server answers WORKFLOW_ID_CONFLICT_POLICY_FAIL with "not supported for
-  # this operation". RFC 0002 scopes the refusal to the terminal verb, so the
-  # low-level client still reaches the server — which is what makes the local
-  # refusal worth having.
-  test "the server rejects id_conflict_policy: :fail, which the surface refuses first", ctx do
-    id = order_id()
-
-    assert {:error, %Temporalex.TransportError{} = error} =
-             Temporalex.Client.start_workflow(
-               ctx.client,
-               Settlement,
-               %{order_id: id, expected: 1},
-               workflow_id: "order-#{id}",
-               start_signal: [name: "settled", args: [settlement("pay-1")]],
-               workflow_id_conflict_policy: :fail,
-               timeout: 10_000
-             )
-
-    assert Exception.message(error) =~ "not supported for this operation"
-
-    assert_raise ArgumentError, ~r/id_conflict_policy: :fail cannot be combined/, fn ->
-      %{order_id: id, expected: 1}
-      |> Settlement.new(id_conflict_policy: :fail)
-      |> Temporalex.client(ctx.client)
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start()
-    end
-  end
-
-  test "a reuse-rejected duplicate surfaces as already-started, not a raw rpc error", ctx do
-    id = order_id()
-
-    done =
-      id
-      |> checkout(1, ctx)
-      |> Temporalex.with_signal("settled", [settlement("pay-1")])
-      |> Temporalex.start!()
-
-    assert {:ok, {:settled, ["pay-1"], _}} = Temporalex.await(done)
-
-    assert {:error, error} =
-             %{order_id: id, expected: 1}
-             |> Settlement.new(id_reuse_policy: :reject_duplicate)
-             |> Temporalex.client(ctx.client)
-             |> Temporalex.with_signal("settled", [settlement("pay-2")])
-             |> Temporalex.start()
-
-    assert %Temporalex.WorkflowAlreadyStartedError{run_id: run_id} = error
-    assert run_id == done.run_id
-  end
-
-  test "search attributes survive the signal-with-start request", ctx do
-    if ctx.search_attribute == nil do
-      raise "no usable search attribute; register CustomKeywordField or install the temporal CLI"
-    end
-
-    id = order_id()
-    label = "sws-#{System.unique_integer([:positive])}"
-
-    handle =
-      start_once_mapping_is_live(fn ->
-        id
-        |> checkout(1, ctx)
-        |> Temporalex.index(%{
-          ctx.search_attribute => Temporalex.SearchAttribute.keyword(label)
-        })
-        |> Temporalex.with_signal("settled", [settlement("pay-1")])
-        |> Temporalex.start()
-      end)
-
-    assert eventually(fn ->
-             visible?("#{ctx.search_attribute} = '#{label}'", handle.workflow_id)
-           end),
-           "the workflow was not indexed under the search attribute sent with the signal"
-
-    assert {:ok, {:settled, ["pay-1"], _}} = Temporalex.await(handle)
-  end
-
-  test "a start_signal with no name is refused by the NIF rather than crashing it", ctx do
-    id = order_id()
-
-    assert {:error, error} =
-             Temporalex.Client.start_workflow(
-               ctx.client,
-               Settlement,
-               %{order_id: id, expected: 1},
-               workflow_id: "order-#{id}",
-               start_signal: [args: [settlement("pay-1")]],
-               timeout: 10_000
-             )
-
-    assert Exception.message(error) =~ "start_signal requires a name"
-  end
-
   defp start_once_mapping_is_live(fun, attempts \\ 30) do
     case fun.() do
       {:ok, handle} ->
@@ -466,5 +194,287 @@ defmodule Temporalex.SignalWithStartIntegrationTest do
         {:cont, false}
       end
     end)
+  end
+
+  # Every test below runs once per client backend (see
+  # Temporalex.TestSupport.Backends); the worker always runs on the NIF.
+  setup %{clients: clients, backend: backend}, do: {:ok, client: clients[backend]}
+
+  for backend <- Backends.all() do
+    describe "#{backend} backend" do
+      @describetag backend: backend
+
+      test "a settlement that arrives before the checkout starts it", ctx do
+        id = order_id()
+
+        handle =
+          id
+          |> checkout(2, ctx)
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start!()
+
+        assert handle.workflow_id == "order-#{id}"
+
+        :ok =
+          Settlement.signal!(%{order_id: id}, "settled", settlement("pay-2"), client: ctx.client)
+
+        assert {:ok, {:settled, ["pay-1", "pay-2"], _}} = Temporalex.await(handle)
+      end
+
+      test "the settlement lands even though it precedes the phase that handles it", ctx do
+        id = order_id()
+
+        handle =
+          id
+          |> checkout(1, ctx)
+          |> Temporalex.with_signal("settled", [settlement("pay-only")])
+          |> Temporalex.start!()
+
+        assert {:ok, {:settled, ["pay-only"], _}} = Temporalex.await(handle)
+      end
+
+      test "a second settlement attaches to the running checkout rather than starting one", ctx do
+        id = order_id()
+
+        first =
+          id
+          |> checkout(2, ctx)
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start!()
+
+        second =
+          id
+          |> checkout(2, ctx)
+          |> Temporalex.with_signal("settled", [settlement("pay-2")])
+          |> Temporalex.start!()
+
+        assert second.run_id == first.run_id
+        assert {:ok, {:settled, ["pay-1", "pay-2"], _}} = Temporalex.await(first)
+      end
+
+      test "a start without with_signal is unchanged", ctx do
+        id = order_id()
+
+        handle = id |> checkout(1, ctx) |> Temporalex.start!()
+
+        :ok =
+          Settlement.signal!(%{order_id: id}, "settled", settlement("pay-1"), client: ctx.client)
+
+        assert {:ok, {:settled, ["pay-1"], _}} = Temporalex.await(handle)
+      end
+
+      test "concurrent settlements racing the start all land exactly once", ctx do
+        id = order_id()
+        payments = for n <- 1..8, do: "pay-#{n}"
+
+        handles =
+          payments
+          |> Task.async_stream(
+            fn payment ->
+              id
+              |> checkout(length(payments), ctx)
+              |> Temporalex.with_signal("settled", [settlement(payment)])
+              |> Temporalex.start!()
+            end,
+            max_concurrency: 8,
+            timeout: 30_000
+          )
+          |> Enum.map(fn
+            {:ok, handle} -> handle
+            {:exit, reason} -> flunk("a racing start failed: #{inspect(reason)}")
+          end)
+
+        assert [_] = handles |> Enum.map(& &1.run_id) |> Enum.uniq()
+        assert {:ok, {:settled, settled, _}} = Temporalex.await(hd(handles))
+        assert settled == Enum.sort(payments)
+      end
+
+      test "a redelivered settlement does not start a second run or double-count", ctx do
+        id = order_id()
+
+        first =
+          id
+          |> checkout(2, ctx)
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start!()
+
+        redelivered =
+          id
+          |> checkout(2, ctx)
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start!()
+
+        assert redelivered.run_id == first.run_id
+
+        :ok =
+          Settlement.signal!(%{order_id: id}, "settled", settlement("pay-2"), client: ctx.client)
+
+        assert {:ok, {:settled, ["pay-1", "pay-2"], _}} = Temporalex.await(first)
+      end
+
+      test "the phase timeout still fires when a settlement never arrives", ctx do
+        id = order_id()
+
+        handle =
+          id
+          |> checkout(2, ctx, %{phase_timeout: 2_000})
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start!()
+
+        assert {:ok, {:timed_out, ["pay-1"]}} = Temporalex.await(handle)
+      end
+
+      test "a rich settlement payload round-trips through the start request", ctx do
+        id = order_id()
+
+        payment =
+          settlement("pay-1", %{
+            "amount" => %{"units" => 1250, "currency" => "GBP"},
+            "transaction_id" => "txn-abc",
+            "refunded" => false,
+            "meta" => nil
+          })
+
+        handle =
+          id
+          |> checkout(1, ctx)
+          |> Temporalex.with_signal("settled", [payment])
+          |> Temporalex.start!()
+
+        assert {:ok, {:settled, ["pay-1"], received}} = Temporalex.await(handle)
+        assert received["pay-1"] == payment
+      end
+
+      test "with_signal/2 sends a signal carrying no arguments at all", ctx do
+        id = order_id()
+
+        handle =
+          id
+          |> checkout(1, ctx)
+          |> Temporalex.with_signal("abandoned")
+          |> Temporalex.start!()
+
+        assert {:ok, {:settled, ["abandoned"], _}} = Temporalex.await(handle)
+      end
+
+      test "retry survives the signal-with-start request", ctx do
+        id = order_id()
+
+        handle =
+          id
+          |> checkout(1, ctx)
+          |> Temporalex.retry(max_attempts: 3)
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start!()
+
+        assert {:ok, {:settled, ["pay-1"], _}} = Temporalex.await(handle)
+      end
+
+      test "priority is refused at the terminal verb, not silently dropped", ctx do
+        id = order_id()
+
+        assert_raise ArgumentError, ~r/cannot be combined with with_signal\/3/, fn ->
+          id
+          |> checkout(1, ctx)
+          |> Temporalex.priority(2)
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start()
+        end
+      end
+
+      # The server answers WORKFLOW_ID_CONFLICT_POLICY_FAIL with "not supported for
+      # this operation". RFC 0002 scopes the refusal to the terminal verb, so the
+      # low-level client still reaches the server — which is what makes the local
+      # refusal worth having.
+      test "the server rejects id_conflict_policy: :fail, which the surface refuses first", ctx do
+        id = order_id()
+
+        assert {:error, %Temporalex.TransportError{} = error} =
+                 Temporalex.Client.start_workflow(
+                   ctx.client,
+                   Settlement,
+                   %{order_id: id, expected: 1},
+                   workflow_id: "order-#{id}",
+                   start_signal: [name: "settled", args: [settlement("pay-1")]],
+                   workflow_id_conflict_policy: :fail,
+                   timeout: 10_000
+                 )
+
+        assert Exception.message(error) =~ "not supported for this operation"
+
+        assert_raise ArgumentError, ~r/id_conflict_policy: :fail cannot be combined/, fn ->
+          %{order_id: id, expected: 1}
+          |> Settlement.new(id_conflict_policy: :fail)
+          |> Temporalex.client(ctx.client)
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start()
+        end
+      end
+
+      test "a reuse-rejected duplicate surfaces as already-started, not a raw rpc error", ctx do
+        id = order_id()
+
+        done =
+          id
+          |> checkout(1, ctx)
+          |> Temporalex.with_signal("settled", [settlement("pay-1")])
+          |> Temporalex.start!()
+
+        assert {:ok, {:settled, ["pay-1"], _}} = Temporalex.await(done)
+
+        assert {:error, error} =
+                 %{order_id: id, expected: 1}
+                 |> Settlement.new(id_reuse_policy: :reject_duplicate)
+                 |> Temporalex.client(ctx.client)
+                 |> Temporalex.with_signal("settled", [settlement("pay-2")])
+                 |> Temporalex.start()
+
+        assert %Temporalex.WorkflowAlreadyStartedError{run_id: run_id} = error
+        assert run_id == done.run_id
+      end
+
+      test "search attributes survive the signal-with-start request", ctx do
+        if ctx.search_attribute == nil do
+          raise "no usable search attribute; register CustomKeywordField or install the temporal CLI"
+        end
+
+        id = order_id()
+        label = "sws-#{System.unique_integer([:positive])}"
+
+        handle =
+          start_once_mapping_is_live(fn ->
+            id
+            |> checkout(1, ctx)
+            |> Temporalex.index(%{
+              ctx.search_attribute => Temporalex.SearchAttribute.keyword(label)
+            })
+            |> Temporalex.with_signal("settled", [settlement("pay-1")])
+            |> Temporalex.start()
+          end)
+
+        assert eventually(fn ->
+                 visible?("#{ctx.search_attribute} = '#{label}'", handle.workflow_id)
+               end),
+               "the workflow was not indexed under the search attribute sent with the signal"
+
+        assert {:ok, {:settled, ["pay-1"], _}} = Temporalex.await(handle)
+      end
+
+      test "a start_signal with no name is refused by the backend rather than crashing it", ctx do
+        id = order_id()
+
+        assert {:error, error} =
+                 Temporalex.Client.start_workflow(
+                   ctx.client,
+                   Settlement,
+                   %{order_id: id, expected: 1},
+                   workflow_id: "order-#{id}",
+                   start_signal: [args: [settlement("pay-1")]],
+                   timeout: 10_000
+                 )
+
+        assert Exception.message(error) =~ "start_signal requires a name"
+      end
+    end
   end
 end

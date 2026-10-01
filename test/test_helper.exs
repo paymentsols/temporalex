@@ -1,6 +1,7 @@
 Code.require_file("../test_support/temporal_server.ex", __DIR__)
 Code.require_file("../test_support/temporal_dev_server.ex", __DIR__)
 Code.require_file("../test_support/temporal_namespace.ex", __DIR__)
+Code.require_file("../test_support/backends.ex", __DIR__)
 
 # External tests share one Temporal dev server, and several declare a FIXED
 # task queue that cannot be made unique per run (`use` options are compile

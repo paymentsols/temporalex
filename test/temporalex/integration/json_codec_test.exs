@@ -14,6 +14,7 @@ defmodule Temporalex.JsonCodecIntegrationTest do
 
   @moduletag :external
 
+  alias Temporalex.TestSupport.Backends
   alias Temporalex.TestSupport.Server
 
   defmodule SimpleWorkflow do
@@ -51,13 +52,10 @@ defmodule Temporalex.JsonCodecIntegrationTest do
     unless cli_available?(), do: raise("`temporal` CLI not on PATH")
 
     worker_name = Module.concat(__MODULE__, :"Worker#{System.unique_integer([:positive])}")
-    client_name = Module.concat(__MODULE__, :"Client#{System.unique_integer([:positive])}")
     task_queue = "json-codec-#{System.unique_integer([:positive])}"
 
-    {:ok, client_pid} =
-      Temporalex.Client.start_link(
-        name: client_name,
-        backend: Temporalex.Backend.TemporalCore,
+    clients =
+      Backends.start_clients(__MODULE__,
         target: Server.target(),
         namespace: Temporalex.TestSupport.Namespace.name(),
         task_queue: task_queue,
@@ -67,7 +65,7 @@ defmodule Temporalex.JsonCodecIntegrationTest do
     {:ok, worker_pid} =
       Temporalex.Worker.start_link(
         name: worker_name,
-        client: client_name,
+        client: clients.nif,
         task_queue: task_queue,
         workflows: [SimpleWorkflow],
         activities: []
@@ -76,66 +74,75 @@ defmodule Temporalex.JsonCodecIntegrationTest do
     on_exit(fn ->
       try do
         if Process.alive?(worker_pid), do: Supervisor.stop(worker_pid, :normal, 5_000)
-        if Process.alive?(client_pid), do: GenServer.stop(client_pid, :normal, 5_000)
       catch
         :exit, _ -> :ok
       end
     end)
 
-    {:ok, client: client_name, worker: worker_name, task_queue: task_queue}
+    {:ok, clients: clients, worker: worker_name, task_queue: task_queue}
   end
 
-  test "JSON-encoded workflow result round-trips via our Client", %{client: client} do
-    workflow_id = "json-result-client-#{System.unique_integer([:positive])}"
+  # Every test below runs once per client backend (see
+  # Temporalex.TestSupport.Backends); the worker always runs on the NIF.
+  setup %{clients: clients, backend: backend}, do: {:ok, client: clients[backend]}
 
-    {:ok, handle} =
-      Temporalex.Client.start_workflow(client, SimpleWorkflow, "hello",
-        workflow_id: workflow_id,
-        timeout: 10_000
-      )
+  for backend <- Backends.all() do
+    describe "#{backend} backend" do
+      @describetag backend: backend
 
-    # Our client gets the result back through the decode path that
-    # auto-detects json/plain metadata. The value should be the same
-    # Elixir term we returned (modulo atoms collapsing to strings).
-    assert {:ok, %{"echoed" => "hello", "ok" => true}} =
-             Temporalex.Client.get_result(handle, timeout: 15_000)
-  end
+      test "JSON-encoded workflow result round-trips via our Client", %{client: client} do
+        workflow_id = "json-result-client-#{System.unique_integer([:positive])}"
 
-  test "JSON-encoded workflow result is renderable by the `temporal` CLI", %{
-    client: client,
-    task_queue: tq
-  } do
-    workflow_id = "json-result-cli-#{System.unique_integer([:positive])}"
+        {:ok, handle} =
+          Temporalex.Client.start_workflow(client, SimpleWorkflow, "hello",
+            workflow_id: workflow_id,
+            timeout: 10_000
+          )
 
-    {:ok, _handle} =
-      Temporalex.Client.start_workflow(client, SimpleWorkflow, "from-cli-test",
-        workflow_id: workflow_id,
-        timeout: 10_000
-      )
+        # Our client gets the result back through the decode path that
+        # auto-detects json/plain metadata. The value should be the same
+        # Elixir term we returned (modulo atoms collapsing to strings).
+        assert {:ok, %{"echoed" => "hello", "ok" => true}} =
+                 Temporalex.Client.get_result(handle, timeout: 15_000)
+      end
 
-    # Wait for completion.
-    :ok = wait_for_completion(workflow_id)
+      test "JSON-encoded workflow result is renderable by the `temporal` CLI", %{
+        client: client,
+        task_queue: tq
+      } do
+        workflow_id = "json-result-cli-#{System.unique_integer([:positive])}"
 
-    # Use the CLI to fetch the result. With JSON encoding, the CLI can
-    # render the payload (the entire reason for this codec mode).
-    {output, exit_code} =
-      System.cmd("temporal", [
-        "workflow",
-        "result",
-        "--workflow-id",
-        workflow_id,
-        "--address",
-        Server.address(),
-        "--namespace",
-        Temporalex.TestSupport.Namespace.name()
-      ])
+        {:ok, _handle} =
+          Temporalex.Client.start_workflow(client, SimpleWorkflow, "from-cli-test",
+            workflow_id: workflow_id,
+            timeout: 10_000
+          )
 
-    assert exit_code == 0,
-           "CLI failed to render workflow result: #{output}\n(task_queue: #{tq})"
+        # Wait for completion.
+        :ok = wait_for_completion(workflow_id)
 
-    # The CLI output should contain the JSON representation of the value.
-    assert output =~ "echoed"
-    assert output =~ "from-cli-test"
+        # Use the CLI to fetch the result. With JSON encoding, the CLI can
+        # render the payload (the entire reason for this codec mode).
+        {output, exit_code} =
+          System.cmd("temporal", [
+            "workflow",
+            "result",
+            "--workflow-id",
+            workflow_id,
+            "--address",
+            Server.address(),
+            "--namespace",
+            Temporalex.TestSupport.Namespace.name()
+          ])
+
+        assert exit_code == 0,
+               "CLI failed to render workflow result: #{output}\n(task_queue: #{tq})"
+
+        # The CLI output should contain the JSON representation of the value.
+        assert output =~ "echoed"
+        assert output =~ "from-cli-test"
+      end
+    end
   end
 
   defp wait_for_completion(workflow_id) do

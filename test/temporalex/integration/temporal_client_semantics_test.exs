@@ -4,6 +4,7 @@ defmodule Temporalex.TemporalClientSemanticsTest do
   @moduletag :external
 
   alias Temporalex.Client
+  alias Temporalex.TestSupport.Backends
   alias Temporalex.TestSupport.TemporalDevServer
   alias Temporalex.Workflow.API
 
@@ -52,13 +53,13 @@ defmodule Temporalex.TemporalClientSemanticsTest do
     temporal = TemporalDevServer.start!()
 
     worker_name = unique_module("Worker")
-    client_name = unique_module("Client")
     task_queue = "temporalex-client-semantics-#{System.unique_integer([:positive])}"
 
-    {:ok, client_pid} =
-      Client.start_link(
-        name: client_name,
-        backend: Temporalex.Backend.TemporalCore,
+    # One client per backend; the NIF client hosts the worker, and every
+    # assertion below runs through each client in turn — same server, same
+    # workflows, so the two backends must report the same semantics.
+    clients =
+      Backends.start_clients(__MODULE__,
         target: temporal.target,
         namespace: "default",
         task_queue: task_queue,
@@ -68,7 +69,7 @@ defmodule Temporalex.TemporalClientSemanticsTest do
     {:ok, worker_pid} =
       Temporalex.Worker.start_link(
         name: worker_name,
-        client: client_name,
+        client: clients.nif,
         task_queue: task_queue,
         workflows: [GateWorkflow, CompletedWorkflow, FailedWorkflow],
         activities: [],
@@ -77,19 +78,18 @@ defmodule Temporalex.TemporalClientSemanticsTest do
       )
 
     try do
-      assert_running_workflow_conflicts(client_name)
-      assert_terminate_if_running(client_name)
-      assert_closed_workflow_reuse(client_name)
-      assert_not_found_errors(client_name)
-      assert_query_reject_condition(client_name)
-      assert_update_rejection(client_name)
+      for backend <- Backends.all() do
+        client_name = Map.fetch!(clients, backend)
+        assert_running_workflow_conflicts(client_name)
+        assert_terminate_if_running(client_name)
+        assert_closed_workflow_reuse(client_name)
+        assert_not_found_errors(client_name)
+        assert_query_reject_condition(client_name)
+        assert_update_rejection(client_name)
+      end
     after
       if Process.alive?(worker_pid) do
         Supervisor.stop(worker_pid, :normal, 15_000)
-      end
-
-      if Process.alive?(client_pid) do
-        GenServer.stop(client_pid, :normal, 15_000)
       end
 
       TemporalDevServer.stop(temporal)
