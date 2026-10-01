@@ -17,6 +17,8 @@ if Code.ensure_loaded?(Temporal.Api.Workflowservice.V1.WorkflowService.Stub) do
     @not_found 5
     @already_exists 6
     @deadline_exceeded 4
+    @cancelled 1
+    @deadline_slack 100
 
     @already_started_type "type.googleapis.com/temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure"
 
@@ -74,19 +76,41 @@ if Code.ensure_loaded?(Temporal.Api.Workflowservice.V1.WorkflowService.Stub) do
 
     defp unary(conn, fun, request, tag, timeout) do
       opts = [metadata: conn.metadata, timeout: timeout]
+      started = System.monotonic_time(:millisecond)
 
       case apply(Stub, fun, [conn.channel, request, opts]) do
-        {:ok, response} -> {:ok, response}
-        {:error, %GRPC.RPCError{status: @deadline_exceeded}} -> {:error, {tag, :timeout, timeout}}
-        {:error, %GRPC.RPCError{} = error} -> {:error, error}
-        {:error, :timeout} -> {:error, {tag, :timeout, timeout}}
-        {:error, other} -> {:error, {:rpc, message(other)}}
+        {:ok, response} ->
+          {:ok, response}
+
+        {:error, error} ->
+          if deadline_error?(error) or (cut_off?(error) and expired?(started, timeout)),
+            do: {:error, {tag, :timeout, timeout}},
+            else: {:error, failure(error)}
       end
     rescue
       error -> {:error, {:rpc, Exception.message(error)}}
     catch
       :exit, reason -> {:error, {:rpc, "gRPC call exited: #{inspect(reason)}"}}
     end
+
+    defp deadline_error?(%GRPC.RPCError{status: @deadline_exceeded}), do: true
+    defp deadline_error?(:timeout), do: true
+    defp deadline_error?(_error), do: false
+
+    # When the deadline passes, the server can reset the stream (CANCELLED, or
+    # Mint's {:server_closed_request, :cancel}) a moment before the client's
+    # own deadline fires. Arriving at the deadline, that is the deadline.
+    defp cut_off?(%GRPC.RPCError{status: @cancelled}), do: true
+    defp cut_off?(%GRPC.RPCError{}), do: false
+    defp cut_off?(_transport_error), do: true
+
+    defp expired?(_started, :infinity), do: false
+
+    defp expired?(started, timeout),
+      do: System.monotonic_time(:millisecond) - started + @deadline_slack >= timeout
+
+    defp failure(%GRPC.RPCError{} = error), do: error
+    defp failure(other), do: {:rpc, message(other)}
 
     @doc "Failure reason for a call on an existing workflow: NOT_FOUND is :not_found."
     def interaction_reason(%GRPC.RPCError{status: @not_found}), do: :not_found

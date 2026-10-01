@@ -579,11 +579,22 @@ if Code.ensure_loaded?(GRPC.Stub) and
             :ok
 
           {:error, reason} ->
-            if Rpc.not_found?(reason) and Keyword.get(opts, :request_id) != nil,
-              do: already_terminated_by(state, workflow_id, run_id, identity, timeout),
-              else: {:error, Rpc.interaction_reason(reason)}
+            terminate_failed(reason, Keyword.get(opts, :request_id), %{
+              state: state,
+              execution: execution(workflow_id, run_id),
+              identity: identity,
+              timeout: timeout
+            })
         end
       end
+    end
+
+    # Only a terminate that carried a request id may turn "not found" (already
+    # closed) into :ok, and only if the close event shows it was this request.
+    defp terminate_failed(reason, request_id, resend) do
+      if Rpc.not_found?(reason) and request_id != nil,
+        do: already_terminated_by(resend),
+        else: {:error, Rpc.interaction_reason(reason)}
     end
 
     defp terminate_identity(identity, nil), do: identity
@@ -592,10 +603,10 @@ if Code.ensure_loaded?(GRPC.Stub) and
     defp terminate_details(nil, _codec), do: {:ok, nil}
     defp terminate_details(details, codec), do: Payloads.encode_list([details], codec)
 
-    defp already_terminated_by(state, workflow_id, run_id, identity, timeout) do
+    defp already_terminated_by(%{state: state, identity: identity, timeout: timeout} = resend) do
       request = %WS.GetWorkflowExecutionHistoryRequest{
         namespace: state.namespace,
-        execution: execution(workflow_id, run_id),
+        execution: resend.execution,
         history_event_filter_type: :HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT,
         skip_archival: true
       }
@@ -686,10 +697,14 @@ if Code.ensure_loaded?(GRPC.Stub) and
           {:ok, response} ->
             acc = [events_of(response) | acc]
 
-            case response.next_page_token do
-              next when next in [nil, ""] -> {:ok, acc |> Enum.reverse() |> Enum.concat()}
-              next -> all_events(state, execution, next, acc, deadline, timeout)
-            end
+            next_events(
+              state,
+              execution,
+              empty_to_nil(response.next_page_token),
+              acc,
+              deadline,
+              timeout
+            )
 
           {:error, {:workflow_history_fetched, :timeout, _}} ->
             {:error, {:workflow_history_fetched, :timeout, timeout}}
@@ -699,6 +714,12 @@ if Code.ensure_loaded?(GRPC.Stub) and
         end
       end
     end
+
+    defp next_events(_state, _execution, nil, acc, _deadline, _timeout),
+      do: {:ok, acc |> Enum.reverse() |> Enum.concat()}
+
+    defp next_events(state, execution, token, acc, deadline, timeout),
+      do: all_events(state, execution, token, acc, deadline, timeout)
 
     defp events_of(%{history: %History{events: events}}), do: events
     defp events_of(_response), do: []

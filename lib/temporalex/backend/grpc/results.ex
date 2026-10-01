@@ -74,20 +74,34 @@ if Code.ensure_loaded?(Temporal.Api.Workflow.V1.WorkflowExecutionInfo) do
 
     @doc "DescribeWorkerDeploymentResponse as a map."
     def deployment(response) do
-      info = response.worker_deployment_info
-      routing = info && info.routing_config
+      response.worker_deployment_info
+      |> deployment_info()
+      |> Map.merge(routing(response.worker_deployment_info))
+      |> Map.put(:conflict_token, response.conflict_token)
+    end
 
+    defp deployment_info(nil),
+      do: %{name: nil, create_time_ms: nil, last_modifier_identity: nil, versions: []}
+
+    defp deployment_info(info) do
       %{
-        name: info && info.name,
-        conflict_token: response.conflict_token,
-        current_version: routing && version(routing.current_deployment_version),
-        ramping_version: routing && version(routing.ramping_deployment_version),
-        ramping_percentage: routing && routing.ramping_version_percentage,
-        create_time_ms: info && millis(info.create_time),
-        last_modifier_identity: info && info.last_modifier_identity,
-        versions: Enum.map((info && info.version_summaries) || [], &version_summary/1)
+        name: info.name,
+        create_time_ms: millis(info.create_time),
+        last_modifier_identity: info.last_modifier_identity,
+        versions: Enum.map(info.version_summaries, &version_summary/1)
       }
     end
+
+    defp routing(%{routing_config: %{} = routing}) do
+      %{
+        current_version: version(routing.current_deployment_version),
+        ramping_version: version(routing.ramping_deployment_version),
+        ramping_percentage: routing.ramping_version_percentage
+      }
+    end
+
+    defp routing(_info),
+      do: %{current_version: nil, ramping_version: nil, ramping_percentage: nil}
 
     defp version_summary(summary) do
       %{
