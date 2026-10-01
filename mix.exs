@@ -96,7 +96,8 @@ defmodule Temporalex.MixProject do
         "docs/sdk_overview.md": [title: "SDK Overview"],
         "docs/programming_model.md": [title: "Programming Model"],
         "docs/implementation_principles.md": [title: "Implementation Principles"],
-        "docs/scheduler_and_replay.md": [title: "Scheduler and Replay"]
+        "docs/scheduler_and_replay.md": [title: "Scheduler and Replay"],
+        "docs/backends.md": [title: "Client Backends: NIF and gRPC"]
       ],
       groups_for_modules: [
         "Public API": [
@@ -114,7 +115,8 @@ defmodule Temporalex.MixProject do
         Backend: [
           Temporalex.Backend,
           Temporalex.Backend.Test,
-          Temporalex.Backend.TemporalCore
+          Temporalex.Backend.TemporalCore,
+          Temporalex.Backend.Grpc
         ],
         Core: [
           Temporalex.Core.Executor

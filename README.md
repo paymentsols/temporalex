@@ -373,6 +373,19 @@ nothing here polls. See [Task queues](#task-queues).
 workflow modules. The queue comes from the modules' `queue:` declarations. One
 queue, one source.
 
+### Backends
+
+`backend:` chooses how a client reaches Temporal.
+`Temporalex.Backend.TemporalCore` (the default) goes through Temporal's Rust
+core via a NIF and hosts workers. `Temporalex.Backend.Grpc` is a pure-Elixir,
+client-only alternative over gRPC: the same client calls with the same results,
+plus history paging and long-polling, visibility listing, reset, Versioning
+Override and Worker Deployment calls, memo and request ids on start, and a
+`payload_codec: :json` that refuses rather than falls back to ETF. Workers stay
+on the NIF, and switching a client back is a one-line change. Its dependencies
+are optional. See [docs/backends.md](docs/backends.md) for the comparison
+matrix, the payload-encoding differences and how to choose or fall back.
+
 ### Payload codecs
 
 | Codec | Behaviour |
@@ -425,7 +438,12 @@ target with `:tls` is refused rather than silently sent in plaintext.
 
 The full client surface is `start_workflow`, `get_result`, `signal_workflow`,
 `query_workflow`, `update_workflow`, `cancel_workflow`, `terminate_workflow`,
-`describe_workflow` and `fetch_workflow_history`.
+`describe_workflow` and `fetch_workflow_history`. On a
+`Temporalex.Backend.Grpc` client there are also `fetch_history_page`,
+`list_workflows`, `update_workflow_options`, `reset_workflow`,
+`set_worker_deployment_current_version` and `describe_worker_deployment`; the
+NIF backend answers those with an `:unsupported` error (see
+[docs/backends.md](docs/backends.md)).
 
 Each of `signal_workflow`, `query_workflow`, `update_workflow`,
 `cancel_workflow`, `terminate_workflow`, `describe_workflow` and
