@@ -518,6 +518,174 @@ defmodule Temporalex.Client do
     end)
   end
 
+  ## Optional operations
+  #
+  # Implemented by Temporalex.Backend.Grpc. The NIF backend (TemporalCore) has
+  # no client call for them and answers with a TransportError whose category is
+  # :unsupported — see docs/backends.md for choosing a backend per client.
+
+  @doc """
+  Fetches one page of a workflow's history, as encoded protobuf.
+
+  Options: `:page_token` (the previous page's `next_page_token`),
+  `:wait_new_event` (long-poll until events after the token exist),
+  `:maximum_page_size`, `:event_filter` (`:all` | `:close`), `:run_id`, and
+  `:timeout`.
+
+  Returns `{:ok, %{history: bytes, next_page_token: binary | nil}}`. For an
+  open run the server returns a `next_page_token` at the end of history only
+  when `wait_new_event: true` was set — that token is what a follower holds on
+  to between polls.
+
+  Requires `Temporalex.Backend.Grpc`.
+  """
+  def fetch_history_page(%Handle{} = handle, opts \\ []) when is_list(opts) do
+    optional_call(handle.client, :fetch_history_page, opts, [handle.workflow_id, handle.run_id],
+      workflow_id: handle.workflow_id,
+      run_id: handle.run_id,
+      workflow_type: handle.workflow_type
+    )
+  end
+
+  def fetch_history_page(client, workflow_id, opts)
+      when is_binary(workflow_id) and is_list(opts) do
+    run_id = Keyword.get(opts, :run_id)
+
+    optional_call(client, :fetch_history_page, opts, [workflow_id, run_id],
+      workflow_id: workflow_id,
+      run_id: run_id
+    )
+  end
+
+  @doc """
+  Lists workflow executions matching a visibility query
+  (`"WorkflowType = 'Checkout' AND ExecutionStatus = 'Running'"`; `""` lists
+  all).
+
+  Options: `:page_size`, `:page_token`, `:timeout`. Returns
+  `{:ok, %{executions: [map()], next_page_token: binary | nil}}`; each
+  execution has the keys `describe_workflow/3` returns.
+
+  Requires `Temporalex.Backend.Grpc`.
+  """
+  def list_workflows(client, query, opts \\ []) when is_binary(query) and is_list(opts) do
+    optional_call(client, :list_workflows, opts, [query], [])
+  end
+
+  @doc """
+  Sets or clears a workflow's Versioning Override.
+
+  `versioning_override:` is `{:pinned, deployment_name, build_id}` (stay on
+  that Worker Deployment Version), `:auto_upgrade` (move with the
+  deployment's Current Version), or `:unset` (remove the override). Returns
+  `{:ok, %{versioning_override: override}}` with the override now in effect.
+
+  Requires `Temporalex.Backend.Grpc`.
+  """
+  def update_workflow_options(%Handle{} = handle, opts) when is_list(opts) do
+    optional_call(
+      handle.client,
+      :update_workflow_options,
+      opts,
+      [handle.workflow_id, handle.run_id],
+      workflow_id: handle.workflow_id,
+      run_id: handle.run_id,
+      workflow_type: handle.workflow_type
+    )
+  end
+
+  def update_workflow_options(client, workflow_id, opts)
+      when is_binary(workflow_id) and is_list(opts) do
+    run_id = Keyword.get(opts, :run_id)
+
+    optional_call(client, :update_workflow_options, opts, [workflow_id, run_id],
+      workflow_id: workflow_id,
+      run_id: run_id
+    )
+  end
+
+  @doc """
+  Resets a workflow to a workflow-task-finished event, starting a new run
+  from there.
+
+  `event_id:` (required) is the `WorkflowTaskCompleted`, `WorkflowTaskTimedOut`
+  or `WorkflowTaskFailed` event to reset to. Optional: `:reason`, `:run_id`, and
+  `:request_id` — passed to the server, which decides what a resend means (server
+  1.32 starts another run for a resent reset of the same base run).
+  Returns `{:ok, %{run_id: new_run_id}}`.
+
+  Requires `Temporalex.Backend.Grpc`.
+  """
+  def reset_workflow(%Handle{} = handle, opts) when is_list(opts) do
+    optional_call(handle.client, :reset_workflow, opts, [handle.workflow_id, handle.run_id],
+      workflow_id: handle.workflow_id,
+      run_id: handle.run_id,
+      workflow_type: handle.workflow_type
+    )
+  end
+
+  def reset_workflow(client, workflow_id, opts) when is_binary(workflow_id) and is_list(opts) do
+    run_id = Keyword.get(opts, :run_id)
+
+    optional_call(client, :reset_workflow, opts, [workflow_id, run_id],
+      workflow_id: workflow_id,
+      run_id: run_id
+    )
+  end
+
+  @doc """
+  Makes `build_id` the Current Version of the Worker Deployment
+  `deployment_name`; `nil` routes new work to unversioned workers.
+
+  Options: `:conflict_token` (from `describe_worker_deployment/3`, to refuse
+  the change if the deployment moved meanwhile), `:ignore_missing_task_queues`,
+  `:allow_no_pollers`, `:timeout`. Returns
+  `{:ok, %{conflict_token: binary, previous_version: version | nil}}`.
+
+  Requires `Temporalex.Backend.Grpc`.
+  """
+  def set_worker_deployment_current_version(client, deployment_name, build_id, opts \\ [])
+      when is_binary(deployment_name) and (is_binary(build_id) or is_nil(build_id)) and
+             is_list(opts) do
+    optional_call(
+      client,
+      :set_worker_deployment_current_version,
+      opts,
+      [deployment_name, build_id],
+      []
+    )
+  end
+
+  @doc """
+  Describes a Worker Deployment: its Current and Ramping versions, its
+  version summaries, and the `conflict_token` for a guarded change.
+
+  Requires `Temporalex.Backend.Grpc`.
+  """
+  def describe_worker_deployment(client, deployment_name, opts \\ [])
+      when is_binary(deployment_name) and is_list(opts) do
+    optional_call(client, :describe_worker_deployment, opts, [deployment_name], [])
+  end
+
+  defp optional_call(client, operation, opts, args, error_meta) do
+    with_client_connection(client, operation, opts, fn %Connection{} = connection, opts ->
+      backend = connection.backend
+      arity = length(args) + 2
+
+      result =
+        if Code.ensure_loaded?(backend) and function_exported?(backend, operation, arity) do
+          apply(backend, operation, [connection.backend_state | args] ++ [opts])
+        else
+          {:error,
+           {:unsupported,
+            "#{operation} is not implemented by #{inspect(backend)}; " <>
+              "use backend: Temporalex.Backend.Grpc (see docs/backends.md)"}}
+        end
+
+      normalize_client_result(result, [operation: operation, client: client] ++ error_meta)
+    end)
+  end
+
   # The backend hands back plain event maps (or raw bytes when raw: true);
   # the public shape is Temporalex.History.
   # raw: true results are bytes and fall through the passthrough clause.

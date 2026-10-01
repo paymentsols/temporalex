@@ -521,6 +521,41 @@ defmodule Temporalex.Backend.TemporalCore do
     end
   end
 
+  # The operations below exist only on the pure-Elixir gRPC client backend
+  # (Temporalex.Backend.Grpc): the NIF's client exposes no call for them. They
+  # answer with a clear error rather than being absent, so a caller learns which
+  # backend to choose instead of meeting an UndefinedFunctionError.
+
+  @impl Temporalex.Backend
+  def fetch_history_page(%ClientState{}, _workflow_id, _run_id, _opts),
+    do: unsupported(:fetch_history_page)
+
+  @impl Temporalex.Backend
+  def list_workflows(%ClientState{}, _query, _opts), do: unsupported(:list_workflows)
+
+  @impl Temporalex.Backend
+  def update_workflow_options(%ClientState{}, _workflow_id, _run_id, _opts),
+    do: unsupported(:update_workflow_options)
+
+  @impl Temporalex.Backend
+  def reset_workflow(%ClientState{}, _workflow_id, _run_id, _opts),
+    do: unsupported(:reset_workflow)
+
+  @impl Temporalex.Backend
+  def set_worker_deployment_current_version(%ClientState{}, _deployment_name, _build_id, _opts),
+    do: unsupported(:set_worker_deployment_current_version)
+
+  @impl Temporalex.Backend
+  def describe_worker_deployment(%ClientState{}, _deployment_name, _opts),
+    do: unsupported(:describe_worker_deployment)
+
+  defp unsupported(operation) do
+    {:error,
+     {:unsupported,
+      "#{operation} is not implemented by the Temporal Core (NIF) client; " <>
+        "start the client with backend: Temporalex.Backend.Grpc (see docs/backends.md)"}}
+  end
+
   defp target(opts) do
     Keyword.get(opts, :target) ||
       Keyword.get(opts, :url) ||
@@ -528,68 +563,9 @@ defmodule Temporalex.Backend.TemporalCore do
       @default_target
   end
 
-  # `:tls` is `true` for TLS against the system roots, or a keyword list of PEM
-  # material, each given inline or as a `_file` path, plus `:domain`, the server
-  # name to verify. Files are read here so the NIF only ever sees bytes.
-  @tls_pem_keys [:server_root_ca_cert, :client_cert, :client_private_key]
-
-  defp tls(opts) do
-    case Keyword.get(opts, :tls) do
-      nil ->
-        {:ok, nil}
-
-      false ->
-        {:ok, nil}
-
-      true ->
-        {:ok, []}
-
-      tls when is_list(tls) ->
-        read_tls(tls)
-
-      other ->
-        {:error,
-         {:invalid_options, ":tls must be true, false or a keyword list, got: #{inspect(other)}"}}
-    end
-  end
-
-  defp read_tls(tls) do
-    Enum.reduce_while(@tls_pem_keys, {:ok, Keyword.take(tls, [:domain])}, fn key, {:ok, acc} ->
-      case tls_pem(tls, key) do
-        {:ok, nil} -> {:cont, {:ok, acc}}
-        {:ok, pem} -> {:cont, {:ok, Keyword.put(acc, key, pem)}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-  end
-
-  defp tls_pem(tls, key) do
-    file_key = :"#{key}_file"
-
-    case {Keyword.get(tls, key), Keyword.get(tls, file_key)} do
-      {nil, nil} ->
-        {:ok, nil}
-
-      {pem, nil} when is_binary(pem) ->
-        {:ok, pem}
-
-      {nil, path} when is_binary(path) ->
-        read_tls_file(file_key, path)
-
-      _both_or_invalid ->
-        {:error, {:invalid_options, ":tls takes one of :#{key} or :#{file_key}, as a binary"}}
-    end
-  end
-
-  defp read_tls_file(file_key, path) do
-    case File.read(path) do
-      {:ok, pem} ->
-        {:ok, pem}
-
-      {:error, reason} ->
-        {:error, {:invalid_options, ":tls :#{file_key} #{path}: #{:file.format_error(reason)}"}}
-    end
-  end
+  # `:tls` is read by the shared option reader so every client backend accepts
+  # the same spellings; files are read there so the NIF only ever sees bytes.
+  defp tls(opts), do: Temporalex.Backend.TlsOptions.read(opts)
 
   # Metrics are opt-in: without `:prometheus` or `:otlp` the runtime starts with
   # telemetry off, exactly as before. Core decodes tags and headers as string

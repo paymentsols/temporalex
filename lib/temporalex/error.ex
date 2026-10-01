@@ -157,6 +157,13 @@ defmodule Temporalex.Error do
     )
   end
 
+  # A backend that cannot perform an operation it was asked for (the NIF client
+  # has no call for list_workflows, reset, and friends): say so, and which
+  # backend does, rather than falling through to the :unknown catch-all.
+  def normalize_client_reason({:unsupported, message}, opts) do
+    transport_error(:unsupported, message, {:unsupported, message}, opts)
+  end
+
   def normalize_client_reason({:connect_error, reason}, opts),
     do: transport_error(:connect, reason, {:connect_error, reason}, opts)
 
