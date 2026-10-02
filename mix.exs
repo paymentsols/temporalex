@@ -50,6 +50,12 @@ defmodule Temporalex.MixProject do
       {:pb, "~> 0.1.0"},
       {:rustler, "~> 0.37", runtime: false, optional: true},
       {:rustler_precompiled, "~> 0.8"},
+      # Optional: the pure-Elixir gRPC client backend (Temporalex.Backend.Grpc).
+      # NIF-only users need none of these; see docs/backends.md.
+      {:temporalio, "~> 1.63", optional: true},
+      {:grpc, "~> 1.0.5", optional: true},
+      {:protobuf, "~> 0.17.0", optional: true},
+      {:mint, "~> 1.7", optional: true},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
@@ -90,7 +96,8 @@ defmodule Temporalex.MixProject do
         "docs/sdk_overview.md": [title: "SDK Overview"],
         "docs/programming_model.md": [title: "Programming Model"],
         "docs/implementation_principles.md": [title: "Implementation Principles"],
-        "docs/scheduler_and_replay.md": [title: "Scheduler and Replay"]
+        "docs/scheduler_and_replay.md": [title: "Scheduler and Replay"],
+        "docs/backends.md": [title: "Client Backends: NIF and gRPC"]
       ],
       groups_for_modules: [
         "Public API": [
@@ -108,7 +115,8 @@ defmodule Temporalex.MixProject do
         Backend: [
           Temporalex.Backend,
           Temporalex.Backend.Test,
-          Temporalex.Backend.TemporalCore
+          Temporalex.Backend.TemporalCore,
+          Temporalex.Backend.Grpc
         ],
         Core: [
           Temporalex.Core.Executor

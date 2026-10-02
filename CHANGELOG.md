@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`Temporalex.Backend.Grpc`, a pure-Elixir client backend.** Choose it per
+  client with `backend: Temporalex.Backend.Grpc`. It talks to Temporal's
+  WorkflowService over gRPC and returns the same results and errors as the NIF
+  backend for start (and signal-with-start), result, signal, query, update,
+  cancel, terminate, describe and history. It is client-only: workers keep
+  running on `Temporalex.Backend.TemporalCore`. Its dependencies (`:temporalio`,
+  `:grpc`, `:protobuf`, `:mint`) are optional, so NIF-only applications are
+  unaffected.
+
+- **Client operations the NIF client lacks**, as optional backend callbacks
+  with `Temporalex.Client` functions: `fetch_history_page/2,3` (one page,
+  optionally long-polled with `wait_new_event`), `list_workflows/3`,
+  `update_workflow_options/2,3` (Versioning Override), `reset_workflow/2,3`,
+  `set_worker_deployment_current_version/4` and `describe_worker_deployment/3`.
+  The NIF backend answers them with a `TransportError` of category
+  `:unsupported`. On the gRPC backend, `start_workflow` also carries `:memo` and
+  `:request_id`, and `terminate_workflow` honours `:request_id`.
+
+- With `payload_codec: :json`, the gRPC backend refuses a value JSON cannot
+  represent instead of sending it as ETF, and decodes results with
+  `binary_to_term(data, [:safe])`. See `docs/backends.md`.
+
 ## 0.7.1 — 2026-09-09
 
 ### Added

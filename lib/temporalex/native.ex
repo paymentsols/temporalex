@@ -1,42 +1,55 @@
 defmodule Temporalex.Native do
   @moduledoc false
 
-  # Consumers download a precompiled NIF from the GitHub release matching
-  # this version — no Rust toolchain or protoc needed. Building from source
-  # instead:
-  #   * in this repo, always (Mix.env() is :dev/:test here and :prod when
-  #     compiled as a dependency), or
-  #   * anywhere, with TEMPORALEX_BUILD=1.
-  # crate/path defaults live HERE (not only in config/config.exs) because a
-  # dependency's config files are never evaluated by consumers.
-  # force_build: is only PASSED when true — an always-present key (even
-  # false) would defeat rustler_precompiled's Keyword.put_new fallback to
-  # `config :rustler_precompiled, force_build: [temporalex: true]`, which is
-  # the remedy its own download-failure message tells consumers to use.
-  @force_build System.get_env("TEMPORALEX_BUILD") in ["1", "true"] or
-                 Mix.env() in [:dev, :test]
+  # `config :temporalex, nif: false` compiles this module without the NIF, for
+  # an application whose clients all use `Temporalex.Backend.Grpc`: nothing is
+  # downloaded or built (no Rust toolchain), and the NIF backend refuses to
+  # start instead. Every other function here needs the runtime this returns.
+  if Application.compile_env(:temporalex, :nif, true) do
+    # Consumers download a precompiled NIF from the GitHub release matching
+    # this version — no Rust toolchain or protoc needed. Building from source
+    # instead:
+    #   * in this repo, always (Mix.env() is :dev/:test here and :prod when
+    #     compiled as a dependency), or
+    #   * anywhere, with TEMPORALEX_BUILD=1.
+    # crate/path defaults live HERE (not only in config/config.exs) because a
+    # dependency's config files are never evaluated by consumers.
+    # force_build: is only PASSED when true — an always-present key (even
+    # false) would defeat rustler_precompiled's Keyword.put_new fallback to
+    # `config :rustler_precompiled, force_build: [temporalex: true]`, which is
+    # the remedy its own download-failure message tells consumers to use.
+    @force_build System.get_env("TEMPORALEX_BUILD") in ["1", "true"] or
+                   Mix.env() in [:dev, :test]
 
-  @precompiled_opts [
-                      otp_app: :temporalex,
-                      crate: "temporalex_nif",
-                      path: "native/temporalex_nif",
-                      base_url:
-                        "https://github.com/cgreeno/temporalex/releases/download/v#{Mix.Project.config()[:version]}",
-                      version: Mix.Project.config()[:version],
-                      nif_versions: ["2.15"],
-                      targets: ~w(
-                        aarch64-apple-darwin
-                        x86_64-apple-darwin
-                        aarch64-unknown-linux-gnu
-                        x86_64-unknown-linux-gnu
-                        aarch64-unknown-linux-musl
-                        x86_64-unknown-linux-musl
-                      )
-                    ] ++ if(@force_build, do: [force_build: true], else: [])
+    @precompiled_opts [
+                        otp_app: :temporalex,
+                        crate: "temporalex_nif",
+                        path: "native/temporalex_nif",
+                        base_url:
+                          "https://github.com/cgreeno/temporalex/releases/download/v#{Mix.Project.config()[:version]}",
+                        version: Mix.Project.config()[:version],
+                        nif_versions: ["2.15"],
+                        targets: ~w(
+                          aarch64-apple-darwin
+                          x86_64-apple-darwin
+                          aarch64-unknown-linux-gnu
+                          x86_64-unknown-linux-gnu
+                          aarch64-unknown-linux-musl
+                          x86_64-unknown-linux-musl
+                        )
+                      ] ++ if(@force_build, do: [force_build: true], else: [])
 
-  use RustlerPrecompiled, @precompiled_opts
+    use RustlerPrecompiled, @precompiled_opts
 
-  def create_runtime(_telemetry_opts), do: :erlang.nif_error(:nif_not_loaded)
+    def create_runtime(_telemetry_opts), do: :erlang.nif_error(:nif_not_loaded)
+  else
+    def create_runtime(_telemetry_opts),
+      do:
+        {:error,
+         "temporalex was compiled with `config :temporalex, nif: false`: " <>
+           "Temporalex.Backend.TemporalCore (clients and workers) is unavailable; " <>
+           "use Temporalex.Backend.Grpc for clients"}
+  end
 
   def connect(_runtime, _url, _api_key, _headers, _tls, _pid),
     do: :erlang.nif_error(:nif_not_loaded)

@@ -10,7 +10,7 @@ defmodule Temporalex.ClientTlsIntegrationTest do
 
   @moduletag :external
 
-  alias Temporalex.Backend.TemporalCore
+  alias Temporalex.TestSupport.Backends
   alias Temporalex.TestSupport.TemporalDevServer
 
   setup_all do
@@ -19,28 +19,41 @@ defmodule Temporalex.ClientTlsIntegrationTest do
     {:ok, temporal: temporal, address: String.replace_prefix(temporal.target, "http://", "")}
   end
 
-  test "without :tls the plaintext server accepts the connection", %{address: address} do
-    assert {:ok, _client} = TemporalCore.start_client([target: address], self())
-  end
+  # Both client backends read :tls the same way and refuse the same mistakes.
+  for backend <- Backends.all() do
+    describe "#{backend} backend" do
+      @describetag backend: backend
 
-  test "tls: true makes a bare host:port target use TLS, which a plaintext server fails",
-       %{address: address} do
-    assert {:error, %Temporalex.TransportError{category: category}} =
-             TemporalCore.start_client(
-               [target: address, tls: true, connect_timeout: 5_000],
-               self()
-             )
+      test "without :tls the plaintext server accepts the connection", %{
+        address: address,
+        backend: backend
+      } do
+        assert {:ok, _client} = Backends.module(backend).start_client([target: address], self())
+      end
 
-    assert category in [:connect, :connect_timeout]
-  end
+      test "tls: true makes a bare host:port target use TLS, which a plaintext server fails",
+           %{address: address, backend: backend} do
+        assert {:error, %Temporalex.TransportError{category: category}} =
+                 Backends.module(backend).start_client(
+                   [target: address, tls: true, connect_timeout: 5_000],
+                   self()
+                 )
 
-  test ":tls options with an explicit http:// target are refused", %{temporal: temporal} do
-    assert {:error, %Temporalex.TransportError{category: :connect, message: message}} =
-             TemporalCore.start_client(
-               [target: temporal.target, tls: [domain: "localhost"]],
-               self()
-             )
+        assert category in [:connect, :connect_timeout]
+      end
 
-    assert message =~ "https"
+      test ":tls options with an explicit http:// target are refused", %{
+        temporal: temporal,
+        backend: backend
+      } do
+        assert {:error, %Temporalex.TransportError{category: :connect, message: message}} =
+                 Backends.module(backend).start_client(
+                   [target: temporal.target, tls: [domain: "localhost"]],
+                   self()
+                 )
+
+        assert message =~ "https"
+      end
+    end
   end
 end
