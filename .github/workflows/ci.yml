@@ -17,7 +17,7 @@ jobs:
     name: Proto descriptor
     # Only a Cargo change can invalidate the descriptor, so this stays off the
     # path of every other PR.
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,7 +101,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
 
@@ -161,7 +161,7 @@ jobs:
 
   test:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -204,7 +204,7 @@ jobs:
 
   e2e:
     name: End-to-End Tests
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: test
     steps:
       - uses: actions/checkout@v4
